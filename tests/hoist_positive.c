@@ -1,4 +1,6 @@
-nclude <stdio.h>
+// RUN: clang-20 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o - | opt-20 -load-pass-plugin=%S/../build/src/libIOOpt.so -passes="mem2reg,instcombine,io-opt" -S | FileCheck-20 %s
+
+#include <stdio.h>
 
 // CHECK-LABEL: @test_hoist
 int test_hoist(FILE *fp, int x, int y) {
