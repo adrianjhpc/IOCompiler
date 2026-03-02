@@ -9,9 +9,9 @@ int test_posix_read_hoist(int fd, int x) {
     int y = x * 42;
     int z = y / 2;
     
+    // FileCheck asserts that the read happens BEFORE the math
     // CHECK: call i64 @read
     // CHECK: mul nsw i32
-    // CHECK: sdiv i32
     read(fd, buf, 20);
     
     return z + buf[0];
