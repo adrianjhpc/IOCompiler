@@ -270,7 +270,7 @@ namespace {
       LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
       ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
 
-      // Run loop Aaalgamation first
+      // Run loop amalgamation first
       for (Loop *L : LI) {
 	if (optimizeLoopIO(L, SE, DL)) {
 	  Changed = true;
@@ -284,7 +284,7 @@ namespace {
 	  if (auto *Call = dyn_cast<CallInst>(&I)) {
 	    Function *CalledFn = Call->getCalledFunction();
                     
-	    // GUARD: Must have a name and be a system/external declaration
+	    // Guard: must have a name and be a system/external declaration
 	    if (!CalledFn || !CalledFn->hasName() || !CalledFn->isDeclaration()) {
 	      LastWrite = nullptr; 
 	      continue;
@@ -292,7 +292,7 @@ namespace {
 
 	    StringRef FnName = CalledFn->getName();
 
-	    // Handle Write Amalgamation
+	    // Handle write amalgamation
 	    if (FnName == "fwrite" || FnName == "write") {
 	      if (LastWrite && isSafeToAmalgamate(LastWrite, Call, AA, DL)) {
 		mergeWrites(LastWrite, Call);
@@ -302,7 +302,7 @@ namespace {
 		LastWrite = Call;
 	      }
 	    } 
-	    // Handle Read Hoisting
+	    // Handle read hoisting
 	    else if (FnName == "fread" || FnName == "read") {
 	      if (hoistRead(Call, AA, DL)) {
 		Changed = true;
@@ -343,19 +343,19 @@ llvmGetPassPluginInfo() {
 					   return false;
 					 });
 
-      // Auto-Registration for Clang's -O1, -O2, -O3 pipelines
-      PB.registerOptimizerLastEPCallback(
-					 [](ModulePassManager &MPM, OptimizationLevel Level) {
-					   // Only run if the user specifically asked for optimizations
-					   if (Level != OptimizationLevel::O0) {
+  // Auto-registration for Clang's -O1, -O2, -O3 pipelines
+            PB.registerOptimizerLastEPCallback(
+                [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+                    // Only run if the user specifically asked for optimizations
+                    if (Level != OptimizationLevel::O0) {
                         
-					     // Because we are hooking into a Module-level manager, 
-					     // we must wrap our FunctionPass in an adaptor so it 
-					     // automatically applies to every function in the module.
-					     FunctionPassManager FPM;
-					     FPM.addPass(IOOptimizationPass());
-					     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
-					   }
-					 });
-    }};
+                        // Because we are hooking into a Module-level manager, 
+                        // we must wrap our FunctionPass in an adaptor so it 
+                        // automatically applies to every function in the module.
+                        FunctionPassManager FPM;
+                        FPM.addPass(IOOptimizationPass());
+                        MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+                    }
+                });  
+  }};
 }
