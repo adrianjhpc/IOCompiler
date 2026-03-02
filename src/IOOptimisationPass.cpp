@@ -2,6 +2,8 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/MemoryLocation.h"
@@ -11,11 +13,38 @@ using namespace llvm;
 namespace {
 
 // -----------------------------------------------------------------------------
-// Helper: Alias Analysis & Interference Logic
+// Helper 1: Check Memory Adjacency using GEPs
+// -----------------------------------------------------------------------------
+bool checkAdjacency(Value *Buf1, Value *Size1, Value *Buf2, const DataLayout &DL) {
+    // If Buf2 is a GetElementPtr (GEP) instruction based on Buf1
+    if (auto *GEP = dyn_cast<GEPOperator>(Buf2)) {
+        if (GEP->getPointerOperand() == Buf1) {
+            // Check if the offset of Buf2 exactly equals the size of Buf1
+            APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+            if (GEP->accumulateConstantOffset(DL, Offset)) {
+                // If Size1 is a constant, we can compare them directly
+                if (auto *ConstSize1 = dyn_cast<ConstantInt>(Size1)) {
+                    if (Offset == ConstSize1->getValue()) {
+                        return true; // Buf2 is exactly Buf1 + Size1
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Helper 2: Alias Analysis & Interference Logic
 // -----------------------------------------------------------------------------
 bool isSafeToAmalgamate(CallInst *Call1, CallInst *Call2, AAResults &AA, const DataLayout &DL) {
     if (Call1->getCalledFunction() != Call2->getCalledFunction()) return false;
     
+    // Safety check: If the original C code uses the return value of fwrite 
+    // (e.g., `int bytes_written = fwrite(...)`), we cannot easily merge them 
+    // without complex math to fake the return values. We skip if return values are used.
+    if (!Call1->use_empty() || !Call2->use_empty()) return false;
+
     Value *FilePtr1 = Call1->getArgOperand(3);
     Value *FilePtr2 = Call2->getArgOperand(3);
     if (FilePtr1 != FilePtr2) return false;
@@ -23,25 +52,59 @@ bool isSafeToAmalgamate(CallInst *Call1, CallInst *Call2, AAResults &AA, const D
     Value *Buf1 = Call1->getArgOperand(0);
     Value *Buf2 = Call2->getArgOperand(0);
     
-    LocationSize Size1 = LocationSize::precise(DL.getTypeStoreSize(Buf1->getType()));
+    // Assuming standard fwrite signature: fwrite(ptr, size, nmemb, stream)
+    // Total bytes written = size * nmemb. For simplicity, we assume size (arg 1) is 1.
+    Value *WriteLen1 = Call1->getArgOperand(2); 
     
-    // TODO: Add adjacency check (Buf2 == Buf1 + Size1) here
+    // ADJACENCY CHECK
+    if (!checkAdjacency(Buf1, WriteLen1, Buf2, DL)) {
+        return false; 
+    }
 
+    // INTERFERENCE CHECK
+    LocationSize Size1 = LocationSize::precise(DL.getTypeStoreSize(Buf1->getType()));
     MemoryLocation Loc1(Buf1, Size1);
     MemoryLocation Loc2(Buf2, LocationSize::precise(DL.getTypeStoreSize(Buf2->getType())));
 
     for (Instruction *I = Call1->getNextNode(); I != Call2; I = I->getNextNode()) {
-        if (!I) return false; 
+        if (!I) return false; // Call2 is not in the same basic block
         if (!I->mayReadOrWriteMemory()) continue;
 
-        ModRefInfo MR1 = AA.getModRefInfo(I, Loc1);
-        if (isModOrRefSet(MR1)) return false;
-
-        ModRefInfo MR2 = AA.getModRefInfo(I, Loc2);
-        if (isModOrRefSet(MR2)) return false;
+        if (isModOrRefSet(AA.getModRefInfo(I, Loc1))) return false;
+        if (isModOrRefSet(AA.getModRefInfo(I, Loc2))) return false;
     }
 
     return true; 
+}
+
+// -----------------------------------------------------------------------------
+// Helper 3: The IR Builder Transformation
+// -----------------------------------------------------------------------------
+void mergeFWrites(CallInst *Call1, CallInst *Call2) {
+    // Set up the builder to insert instructions right before Call2
+    IRBuilder<> Builder(Call2);
+
+    // Calculate the new length: Len1 + Len2
+    Value *Len1 = Call1->getArgOperand(2);
+    Value *Len2 = Call2->getArgOperand(2);
+    Value *NewLen = Builder.CreateAdd(Len1, Len2, "merged.fwrite.len");
+
+    // Construct the new arguments: {Buf1, Size (usually 1), NewLen, FilePtr}
+    Value *Args[] = {
+        Call1->getArgOperand(0), 
+        Call1->getArgOperand(1), 
+        NewLen, 
+        Call1->getArgOperand(3)
+    };
+
+    // Create the new fwrite instruction
+    Builder.CreateCall(Call1->getCalledFunction(), Args);
+
+    // Erase the old, individual calls from the basic block
+    Call1->eraseFromParent();
+    Call2->eraseFromParent();
+    
+    errs() << "Successfully amalgamated two fwrite calls!\n";
 }
 
 // -----------------------------------------------------------------------------
@@ -51,16 +114,33 @@ struct IOOptimizationPass : public PassInfoMixin<IOOptimizationPass> {
     
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
         bool Changed = false;
-        
-        // Extract Analysis Results
         AAResults &AA = FAM.getResult<AAManager>(F);
         const DataLayout &DL = F.getParent()->getDataLayout();
 
-        // Basic block and instruction iteration goes here...
-        // (In a real implementation, you would store found I/O calls in a list 
-        // and then compare them using isSafeToAmalgamate)
+        for (BasicBlock &BB : F) {
+            CallInst *LastFWrite = nullptr;
 
-        errs() << "Running IOOptimizationPass on: " << F.getName() << "\n";
+            // We must use make_early_inc_range because we are deleting instructions
+            for (Instruction &I : llvm::make_early_inc_range(BB)) {
+                if (auto *Call = dyn_cast<CallInst>(&I)) {
+                    Function *CalledFn = Call->getCalledFunction();
+                    
+                    if (CalledFn && CalledFn->getName() == "fwrite") {
+                        if (LastFWrite && isSafeToAmalgamate(LastFWrite, Call, AA, DL)) {
+                            
+                            mergeFWrites(LastFWrite, Call);
+                            Changed = true;
+                            
+                            // Reset LastFWrite since we merged it
+                            LastFWrite = nullptr; 
+                        } else {
+                            // Keep track of this one to potentially merge with the next
+                            LastFWrite = Call;
+                        }
+                    }
+                }
+            }
+        }
 
         return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
@@ -87,3 +167,4 @@ llvmGetPassPluginInfo() {
                 });
         }};
 }
+
