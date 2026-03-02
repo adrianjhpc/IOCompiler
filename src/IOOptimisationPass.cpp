@@ -11,6 +11,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include <vector>
 
 using namespace llvm;
@@ -168,7 +169,7 @@ namespace {
   }
 
   // ------------------------------------------------------------------------------------------
-  // Loop I/O Amalgamation for non-unit stride accesses (but still predictable ones  using SCEV
+  // Loop I/O amalgamation for non-unit stride accesses (but still predictable ones) using SCEV
   // ------------------------------------------------------------------------------------------
   bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
     BasicBlock *Preheader = L->getLoopPreheader();
@@ -179,48 +180,57 @@ namespace {
 
     bool Changed = false;
 
+    // Set up the SCEV Expander (used to mathematically reconstruct pointers)
+    SCEVExpander Expander(SE, DL, "io.expander");
+
     for (BasicBlock *BB : L->blocks()) {
       for (Instruction &I : llvm::make_early_inc_range(*BB)) {
-	if (auto *Call = dyn_cast<CallInst>(&I)) {
+        if (auto *Call = dyn_cast<CallInst>(&I)) {
                 
-	  IOArgs Args = getIOArguments(Call);
-	  if (Args.Type != IOArgs::C_FWRITE && Args.Type != IOArgs::POSIX_WRITE && Args.Type != IOArgs::CXX_WRITE) continue;
+          IOArgs Args = getIOArguments(Call);
+          if (Args.Type != IOArgs::C_FWRITE && Args.Type != IOArgs::POSIX_WRITE && Args.Type != IOArgs::CXX_WRITE) continue;
 
-	  auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
-	  if (!ConstLen) continue;
+          // Ensure the Target (fd or FILE*) does not change across iterations
+          if (!L->isLoopInvariant(Args.Target)) continue;
 
-	  const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
-	  const SCEVAddRecExpr *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV);
-	  if (!AddRec || AddRec->getLoop() != L) continue;
+          auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
+          if (!ConstLen) continue;
 
-	  const SCEV *Step = AddRec->getStepRecurrence(SE);
+          const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
+          const SCEVAddRecExpr *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV);
+          if (!AddRec || AddRec->getLoop() != L) continue;
 
-	  if (auto *StepConst = dyn_cast<SCEVConstant>(Step)) {
-	    if (StepConst->getValue()->getValue() == ConstLen->getValue()) {
+          const SCEV *Step = AddRec->getStepRecurrence(SE);
+
+          if (auto *StepConst = dyn_cast<SCEVConstant>(Step)) {
+            if (StepConst->getValue()->getValue() == ConstLen->getValue()) {
                         
-	      uint64_t TotalLenBytes = TripCount * ConstLen->getZExtValue();
+              uint64_t TotalLenBytes = TripCount * ConstLen->getZExtValue();
                         
-	      Value *BasePtr = nullptr;
-	      if (auto *Unknown = dyn_cast<SCEVUnknown>(AddRec->getStart())) {
-		BasePtr = Unknown->getValue();
-	      } else continue; 
+              // Use SCEVExpander to retrieve the starting pointer
+              // no matter how complex the user's pointer arithmetic was.
+	      // This should let us distinguish between separate file pointers.
+              Instruction *InsertPt = Preheader->getTerminator();
+              Value *BasePtr = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), InsertPt);
 
-	      IRBuilder<> Builder(Preheader->getTerminator());
-	      Value *NewLen = Builder.getInt64(TotalLenBytes);
+              IRBuilder<> Builder(InsertPt);
+              
+              // Match the exact bit-width of the original length parameter
+              Value *NewLen = Builder.getIntN(Args.Length->getType()->getIntegerBitWidth(), TotalLenBytes);
                         
-	      std::vector<Value *> NewArgs;
-	      if (Args.Type == IOArgs::C_FWRITE) {
-		NewArgs = {BasePtr, Call->getArgOperand(1), NewLen, Args.Target};
-	      } else {
-		NewArgs = {Args.Target, BasePtr, NewLen};
-	      }
+              std::vector<Value *> NewArgs;
+              if (Args.Type == IOArgs::C_FWRITE) {
+                NewArgs = {BasePtr, Call->getArgOperand(1), NewLen, Args.Target};
+              } else {
+                NewArgs = {Args.Target, BasePtr, NewLen};
+              }
 
-	      Builder.CreateCall(Call->getCalledFunction(), NewArgs);
-	      Call->eraseFromParent();
-	      Changed = true;
-	    }
-	  }
-	}
+              Builder.CreateCall(Call->getCalledFunction(), NewArgs);
+              Call->eraseFromParent();
+              Changed = true;
+            }
+          }
+        }
       }
     }
     return Changed;
