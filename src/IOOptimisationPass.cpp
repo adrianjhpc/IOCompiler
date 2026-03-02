@@ -108,6 +108,43 @@ void mergeFWrites(CallInst *Call1, CallInst *Call2) {
 }
 
 // -----------------------------------------------------------------------------
+// Helper 4: Hoist Read Operations
+// -----------------------------------------------------------------------------
+bool hoistRead(CallInst *ReadCall, AAResults &AA, const DataLayout &DL) {
+    Value *DestBuf = ReadCall->getArgOperand(0);
+    LocationSize ReadSize = LocationSize::precise(DL.getTypeStoreSize(DestBuf->getType()));
+    MemoryLocation DestLoc(DestBuf, ReadSize);
+
+    Instruction *InsertPoint = ReadCall;
+    Instruction *Prev = ReadCall->getPrevNode();
+    
+    while (Prev) {
+        if (Prev->isTerminator() || isa<PHINode>(Prev)) break;
+
+        if (Prev->mayReadOrWriteMemory()) {
+            ModRefInfo MR = AA.getModRefInfo(Prev, DestLoc);
+            // If the previous instruction interferes with our buffer, we must stop here
+            if (isModOrRefSet(MR)) break;
+            
+            // We also must stop if the previous instruction modifies the File Pointer
+            Value *FilePtr = ReadCall->getArgOperand(3);
+            MemoryLocation FilePtrLoc(FilePtr, LocationSize::beforeOrAfterPointer());
+            if (isModSet(AA.getModRefInfo(Prev, FilePtrLoc))) break;
+        }
+
+        InsertPoint = Prev;
+        Prev = Prev->getPrevNode();
+    }
+
+    if (InsertPoint != ReadCall) {
+        ReadCall->moveBefore(InsertPoint);
+        errs() << "Successfully hoisted a read operation!\n";
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
 // The Main Pass
 // -----------------------------------------------------------------------------
 struct IOOptimizationPass : public PassInfoMixin<IOOptimizationPass> {
@@ -117,31 +154,37 @@ struct IOOptimizationPass : public PassInfoMixin<IOOptimizationPass> {
         AAResults &AA = FAM.getResult<AAManager>(F);
         const DataLayout &DL = F.getParent()->getDataLayout();
 
-        for (BasicBlock &BB : F) {
-            CallInst *LastFWrite = nullptr;
+for (BasicBlock &BB : F) {
+    CallInst *LastFWrite = nullptr;
 
-            // We must use make_early_inc_range because we are deleting instructions
-            for (Instruction &I : llvm::make_early_inc_range(BB)) {
-                if (auto *Call = dyn_cast<CallInst>(&I)) {
-                    Function *CalledFn = Call->getCalledFunction();
-                    
-                    if (CalledFn && CalledFn->getName() == "fwrite") {
-                        if (LastFWrite && isSafeToAmalgamate(LastFWrite, Call, AA, DL)) {
-                            
-                            mergeFWrites(LastFWrite, Call);
-                            Changed = true;
-                            
-                            // Reset LastFWrite since we merged it
-                            LastFWrite = nullptr; 
-                        } else {
-                            // Keep track of this one to potentially merge with the next
-                            LastFWrite = Call;
-                        }
-                    }
+    for (Instruction &I : llvm::make_early_inc_range(BB)) {
+        if (auto *Call = dyn_cast<CallInst>(&I)) {
+            Function *CalledFn = Call->getCalledFunction();
+            if (!CalledFn || !CalledFn->hasName()) continue;
+
+            StringRef FnName = CalledFn->getName();
+
+            // 1. Handle fwrite Amalgamation
+            if (FnName == "fwrite") {
+                if (LastFWrite && isSafeToAmalgamate(LastFWrite, Call, AA, DL)) {
+                    mergeFWrites(LastFWrite, Call);
+                    Changed = true;
+                    LastFWrite = nullptr; 
+                } else {
+                    LastFWrite = Call;
                 }
+            } 
+            // 2. Handle fread/read Hoisting
+            else if (FnName == "fread" || FnName == "read") {
+                if (hoistRead(Call, AA, DL)) {
+                    Changed = true;
+                }
+                // Reset fwrite state since a read might intervene
+                LastFWrite = nullptr; 
             }
         }
-
+    }
+}
         return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
 };
