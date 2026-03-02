@@ -330,7 +330,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
   return {
     LLVM_PLUGIN_API_VERSION, "IOOptimizationPass", LLVM_VERSION_STRING,
-      [](PassBuilder &PB) {
+    [](PassBuilder &PB) {
             
       // Manual 'opt' Registration (needed for the test suite)
       PB.registerPipelineParsingCallback(
@@ -343,19 +343,19 @@ llvmGetPassPluginInfo() {
 					   return false;
 					 });
 
-  // Auto-registration for Clang's -O1, -O2, -O3 pipelines
-            PB.registerOptimizerLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
-                    // Only run if the user specifically asked for optimizations
-                    if (Level != OptimizationLevel::O0) {
+      // Auto-registration for Clang's -O1, -O2, -O3 pipelines
+      PB.registerOptimizerLastEPCallback(
+					 [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+					   // Only run if the user specifically asked for optimizations
+					   if (Level != OptimizationLevel::O0) {
                         
-                        // Because we are hooking into a Module-level manager, 
-                        // we must wrap our FunctionPass in an adaptor so it 
-                        // automatically applies to every function in the module.
-                        FunctionPassManager FPM;
-                        FPM.addPass(IOOptimizationPass());
-                        MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
-                    }
-                });  
-  }};
+					     // Because we are hooking into a Module-level manager, 
+					     // we must wrap our FunctionPass in an adaptor so it 
+					     // automatically applies to every function in the module.
+					     FunctionPassManager FPM;
+					     FPM.addPass(IOOptimizationPass());
+					     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+					   }
+					 });  
+    }};
 }
