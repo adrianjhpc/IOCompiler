@@ -10,6 +10,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Demangle/Demangle.h"
 #include <vector>
 
 using namespace llvm;
@@ -17,32 +18,48 @@ using namespace llvm;
 namespace {
 
   // -----------------------------------------------------------------------------
-  // API abstraction for POSIX vs C-Standard I/O
+  // API abstraction and demangling
   // -----------------------------------------------------------------------------
   struct IOArgs {
-    Value *Target; // FILE* or fd (int)
-    Value *Buffer; // The memory pointer
-    Value *Length; // The size of the read/write
+    Value *Target; 
+    Value *Buffer; 
+    Value *Length; 
+    enum { NONE, C_FWRITE, C_FREAD, POSIX_WRITE, POSIX_READ, CXX_WRITE, CXX_READ } Type;
   };
 
   IOArgs getIOArguments(CallInst *Call) {
-    StringRef Name = Call->getCalledFunction()->getName();
+    Function *F = Call->getCalledFunction();
+    if (!F || !F->hasName() || !F->isDeclaration()) return {nullptr, nullptr, nullptr, IOArgs::NONE};
+
+    // Demangle the name
+    std::string Demangled = llvm::demangle(F->getName().str());
     
-    if (Name == "fwrite" || Name == "fread") {
-      // Signature: ptr buf, size_t size, size_t nmemb, FILE *stream
-      // Assuming size is 1, nmemb (Arg 2) is the length
-      return {Call->getArgOperand(3), Call->getArgOperand(0), Call->getArgOperand(2)};
-    } 
-    else if (Name == "write" || Name == "read") {
-      // Signature: int fd, ptr buf, size_t count
-      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2)};
+    // C Standard Library
+    if (Demangled == "fwrite") return {Call->getArgOperand(3), Call->getArgOperand(0), Call->getArgOperand(2), IOArgs::C_FWRITE};
+    if (Demangled == "fread")  return {Call->getArgOperand(3), Call->getArgOperand(0), Call->getArgOperand(2), IOArgs::C_FREAD};
+    
+    // POSIX Calls
+    if (Demangled == "write")  return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_WRITE};
+    if (Demangled == "read")   return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_READ};
+
+    // C++ Standard Library (Catch both the basic_ template and the standard typedefs)
+    if ((Demangled.find("std::basic_ostream") != std::string::npos || 
+         Demangled.find("std::ostream") != std::string::npos) && 
+	Demangled.find("::write") != std::string::npos) {
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::CXX_WRITE};
     }
     
-    return {nullptr, nullptr, nullptr};
+    if ((Demangled.find("std::basic_istream") != std::string::npos || 
+         Demangled.find("std::istream") != std::string::npos) && 
+	Demangled.find("::read") != std::string::npos) {
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::CXX_READ};
+    }
+
+    return {nullptr, nullptr, nullptr, IOArgs::NONE};
   }
 
   // -----------------------------------------------------------------------------
-  // Check memory adjacency using GEPs
+  // Check memory adjacency
   // -----------------------------------------------------------------------------
   bool checkAdjacency(Value *Buf1, Value *Size1, Value *Buf2, const DataLayout &DL) {
     if (auto *GEP = dyn_cast<GEPOperator>(Buf2)) {
@@ -50,9 +67,7 @@ namespace {
 	APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
 	if (GEP->accumulateConstantOffset(DL, Offset)) {
 	  if (auto *ConstSize1 = dyn_cast<ConstantInt>(Size1)) {
-	    if (Offset == ConstSize1->getValue()) {
-	      return true; 
-	    }
+	    if (Offset == ConstSize1->getValue()) return true; 
 	  }
 	}
       }
@@ -61,25 +76,18 @@ namespace {
   }
 
   // -----------------------------------------------------------------------------
-  // Alias analysis and interference logic for writes
+  // Alias analysis and interference 
   // -----------------------------------------------------------------------------
   bool isSafeToAmalgamate(CallInst *Call1, CallInst *Call2, AAResults &AA, const DataLayout &DL) {
     if (Call1->getCalledFunction() != Call2->getCalledFunction()) return false;
-    
-    // We cannot easily merge them if the return values are used by the program
     if (!Call1->use_empty() || !Call2->use_empty()) return false;
 
     IOArgs Args1 = getIOArguments(Call1);
     IOArgs Args2 = getIOArguments(Call2);
-    
     if (!Args1.Target || !Args2.Target || Args1.Target != Args2.Target) return false;
 
-    // Adjacency check
-    if (!checkAdjacency(Args1.Buffer, Args1.Length, Args2.Buffer, DL)) {
-      return false; 
-    }
+    if (!checkAdjacency(Args1.Buffer, Args1.Length, Args2.Buffer, DL)) return false; 
 
-    // Interference check
     LocationSize Size1 = LocationSize::precise(DL.getTypeStoreSize(Args1.Buffer->getType()));
     MemoryLocation Loc1(Args1.Buffer, Size1);
     MemoryLocation Loc2(Args2.Buffer, LocationSize::precise(DL.getTypeStoreSize(Args2.Buffer->getType())));
@@ -87,11 +95,9 @@ namespace {
     for (Instruction *I = Call1->getNextNode(); I != Call2; I = I->getNextNode()) {
       if (!I) return false; 
       if (!I->mayReadOrWriteMemory()) continue;
-
       if (isModOrRefSet(AA.getModRefInfo(I, Loc1))) return false;
       if (isModOrRefSet(AA.getModRefInfo(I, Loc2))) return false;
     }
-
     return true; 
   }
 
@@ -104,27 +110,25 @@ namespace {
     IOArgs Args2 = getIOArguments(Call2);
 
     Value *NewLen = Builder.CreateAdd(Args1.Length, Args2.Length, "merged.io.len");
-    
-    StringRef Name = Call1->getCalledFunction()->getName();
     std::vector<Value *> NewArgs;
     
-    // Reconstruct the argument list based on the target API
-    if (Name == "fwrite") {
+    // Reconstruct arguments based on the API abstraction
+    if (Args1.Type == IOArgs::C_FWRITE) {
       NewArgs = {Args1.Buffer, Call1->getArgOperand(1), NewLen, Args1.Target};
-    } else if (Name == "write") {
+    } else {
+      // POSIX and C++ both use (Target, Buffer, Length)
       NewArgs = {Args1.Target, Args1.Buffer, NewLen};
     }
 
     Builder.CreateCall(Call1->getCalledFunction(), NewArgs);
-
     Call1->eraseFromParent();
     Call2->eraseFromParent();
     
-    errs() << "Successfully amalgamated two " << Name << " calls!\n";
+    errs() << "Successfully amalgamated writes using demangled C++/POSIX/C APIs!\n";
   }
 
   // -----------------------------------------------------------------------------
-  // Hoisting reads with dominance and interference checks
+  // Hoisting reads
   // -----------------------------------------------------------------------------
   bool hoistRead(CallInst *ReadCall, AAResults &AA, const DataLayout &DL) {
     IOArgs Args = getIOArguments(ReadCall);
@@ -139,20 +143,14 @@ namespace {
     while (Prev) {
       if (Prev->isTerminator() || isa<PHINode>(Prev)) break;
 
-      // Check whether 'Prev' define an operand we need?
       bool DependsOnPrev = false;
       for (Value *Op : ReadCall->operands()) {
-	if (Op == Prev) {
-	  DependsOnPrev = true;
-	  break;
-	}
+	if (Op == Prev) { DependsOnPrev = true; break; }
       }
-      if (DependsOnPrev) break; // Make sure we do not hoist past our own definitions
+      if (DependsOnPrev) break; 
 
-      // Interference check 
       if (Prev->mayReadOrWriteMemory()) {
 	if (isModOrRefSet(AA.getModRefInfo(Prev, DestLoc))) break;
-            
 	MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
 	if (isModSet(AA.getModRefInfo(Prev, TargetLoc))) break;
       }
@@ -162,91 +160,62 @@ namespace {
     }
 
     if (InsertPoint != ReadCall) {
-      // Use getIterator() to safely preserve debug metadata
       ReadCall->moveBefore(InsertPoint->getIterator());
-      errs() << "Successfully hoisted a " << ReadCall->getCalledFunction()->getName() << " call!\n";
+      errs() << "Successfully hoisted a read call!\n";
       return true;
     }
     return false;
   }
 
-  // -----------------------------------------------------------------------------
-  // Loop I/O amalgamation of non-unit stride accesses using SCEV
-  // -----------------------------------------------------------------------------
-  bool optimizeLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
-    // We need a Preheader (a basic block that executes exactly once before the loop)
-    // to safely insert our hoisted write call.
+  // ------------------------------------------------------------------------------------------
+  // Loop I/O Amalgamation for non-unit stride accesses (but still predictable ones  using SCEV
+  // ------------------------------------------------------------------------------------------
+  bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
     BasicBlock *Preheader = L->getLoopPreheader();
     if (!Preheader) return false;
 
-    // Check if the loop has a known, constant number of iterations
     unsigned TripCount = SE.getSmallConstantTripCount(L);
     if (TripCount == 0) return false;
 
     bool Changed = false;
 
-    // Scan the loop body for I/O calls
     for (BasicBlock *BB : L->blocks()) {
       for (Instruction &I : llvm::make_early_inc_range(*BB)) {
 	if (auto *Call = dyn_cast<CallInst>(&I)) {
                 
-	  Function *CalledFn = Call->getCalledFunction();
-	  if (!CalledFn || !CalledFn->hasName() || !CalledFn->isDeclaration()) continue;
-
-	  StringRef Name = CalledFn->getName();
-	  if (Name != "write" && Name != "fwrite") continue;
-
 	  IOArgs Args = getIOArguments(Call);
-                
-	  // We only handle constant write lengths for this optimization
+	  if (Args.Type != IOArgs::C_FWRITE && Args.Type != IOArgs::POSIX_WRITE && Args.Type != IOArgs::CXX_WRITE) continue;
+
 	  auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
 	  if (!ConstLen) continue;
 
-	  // Work out how the buffer pointer behaves across iterations.
 	  const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
-                
-	  // An AddRecExpr represents a value that changes by a constant "step" each iteration.
-	  // (e.g., ptr = ptr + step)
 	  const SCEVAddRecExpr *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV);
-                
-	  // Ensure the pointer actually increments based on THIS loop
 	  if (!AddRec || AddRec->getLoop() != L) continue;
 
-	  // Get the step amount (how much the pointer moves each loop)
 	  const SCEV *Step = AddRec->getStepRecurrence(SE);
 
-	  // If the pointer increments by the exact size of the write length, 
-	  // the writes form a perfectly contiguous block of memory.
 	  if (auto *StepConst = dyn_cast<SCEVConstant>(Step)) {
 	    if (StepConst->getValue()->getValue() == ConstLen->getValue()) {
                         
-	      errs() << "SCEV proved loop I/O is contiguous! Unrolling...\n";
-
-	      // Calculate the new total length: TripCount * ConstLen
 	      uint64_t TotalLenBytes = TripCount * ConstLen->getZExtValue();
                         
-	      // Find the base pointer (the value of the pointer on Iteration 0)
 	      Value *BasePtr = nullptr;
 	      if (auto *Unknown = dyn_cast<SCEVUnknown>(AddRec->getStart())) {
 		BasePtr = Unknown->getValue();
-	      } else {
-		continue; // Start pointer is too complex to easily extract
-	      }
+	      } else continue; 
 
-	      // Generate the amalgamated write in the Preheader
 	      IRBuilder<> Builder(Preheader->getTerminator());
 	      Value *NewLen = Builder.getInt64(TotalLenBytes);
                         
 	      std::vector<Value *> NewArgs;
-	      if (Name == "fwrite") {
+	      if (Args.Type == IOArgs::C_FWRITE) {
 		NewArgs = {BasePtr, Call->getArgOperand(1), NewLen, Args.Target};
 	      } else {
 		NewArgs = {Args.Target, BasePtr, NewLen};
 	      }
 
-	      Builder.CreateCall(CalledFn, NewArgs);
-
-	      // Delete the original small write from inside the loop
+	      Builder.CreateCall(Call->getCalledFunction(), NewArgs);
 	      Call->eraseFromParent();
 	      Changed = true;
 	    }
@@ -260,21 +229,17 @@ namespace {
   // -----------------------------------------------------------------------------
   // Main pass
   // -----------------------------------------------------------------------------
-  struct IOOptimizationPass : public PassInfoMixin<IOOptimizationPass> {
-    
+  struct IOOptimisationPass : public PassInfoMixin<IOOptimisationPass> {
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
       bool Changed = false;
       AAResults &AA = FAM.getResult<AAManager>(F);
       const DataLayout &DL = F.getParent()->getDataLayout();
-
+        
       LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
       ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
 
-      // Run loop amalgamation first
       for (Loop *L : LI) {
-	if (optimizeLoopIO(L, SE, DL)) {
-	  Changed = true;
-	}
+	if (optimiseLoopIO(L, SE, DL)) Changed = true;
       }
 
       for (BasicBlock &BB : F) {
@@ -282,41 +247,24 @@ namespace {
 
 	for (Instruction &I : llvm::make_early_inc_range(BB)) {
 	  if (auto *Call = dyn_cast<CallInst>(&I)) {
-	    Function *CalledFn = Call->getCalledFunction();
                     
-	    // Guard: must have a name and be a system/external declaration
-	    if (!CalledFn || !CalledFn->hasName() || !CalledFn->isDeclaration()) {
-	      LastWrite = nullptr; 
-	      continue;
-	    }
+	    IOArgs Args = getIOArguments(Call);
 
-	    StringRef FnName = CalledFn->getName();
-
-	    // Handle write amalgamation
-	    if (FnName == "fwrite" || FnName == "write") {
+	    if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::CXX_WRITE) {
 	      if (LastWrite && isSafeToAmalgamate(LastWrite, Call, AA, DL)) {
 		mergeWrites(LastWrite, Call);
 		Changed = true;
 		LastWrite = nullptr; 
-	      } else {
-		LastWrite = Call;
-	      }
+	      } else LastWrite = Call;
 	    } 
-	    // Handle read hoisting
-	    else if (FnName == "fread" || FnName == "read") {
-	      if (hoistRead(Call, AA, DL)) {
-		Changed = true;
-	      }
+	    else if (Args.Type == IOArgs::C_FREAD || Args.Type == IOArgs::POSIX_READ || Args.Type == IOArgs::CXX_READ) {
+	      if (hoistRead(Call, AA, DL)) Changed = true;
 	      LastWrite = nullptr; 
 	    } 
-	    // Other function calls might have side effects, reset state
-	    else {
-	      LastWrite = nullptr;
-	    }
+	    else LastWrite = nullptr;
 	  }
 	}
       }
-
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
   };
@@ -326,36 +274,22 @@ namespace {
 // -----------------------------------------------------------------------------
 // Pass plugin registration
 // -----------------------------------------------------------------------------
-extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
-llvmGetPassPluginInfo() {
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
   return {
-    LLVM_PLUGIN_API_VERSION, "IOOptimizationPass", LLVM_VERSION_STRING,
+    LLVM_PLUGIN_API_VERSION, "IOOptimisationPass", LLVM_VERSION_STRING,
     [](PassBuilder &PB) {
-            
-      // Manual 'opt' Registration (needed for the test suite)
       PB.registerPipelineParsingCallback(
-					 [](StringRef Name, FunctionPassManager &FPM,
-					    ArrayRef<PassBuilder::PipelineElement>) {
-					   if (Name == "io-opt") {
-					     FPM.addPass(IOOptimizationPass());
-					     return true;
-					   }
+					 [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
+					   if (Name == "io-opt") { FPM.addPass(IOOptimisationPass()); return true; }
 					   return false;
 					 });
-
-      // Auto-registration for Clang's -O1, -O2, -O3 pipelines
       PB.registerOptimizerLastEPCallback(
 					 [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
-					   // Only run if the user specifically asked for optimizations
 					   if (Level != OptimizationLevel::O0) {
-                        
-					     // Because we are hooking into a Module-level manager, 
-					     // we must wrap our FunctionPass in an adaptor so it 
-					     // automatically applies to every function in the module.
 					     FunctionPassManager FPM;
-					     FPM.addPass(IOOptimizationPass());
+					     FPM.addPass(IOOptimisationPass());
 					     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
 					   }
-					 });  
+					 });
     }};
 }
