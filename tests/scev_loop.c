@@ -1,0 +1,19 @@
+// RUN: clang-20 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o - | opt-20 -load-pass-plugin=%S/../build/src/libIOOpt.so -passes="mem2reg,instcombine,indvars,loop-simplify,io-opt" -S | FileCheck-20 %s
+
+#include <unistd.h>
+
+// CHECK-LABEL: @test_scev_loop
+void test_scev_loop(int fd) {
+    char buf[1000];
+    
+    // FileCheck asserts that the write happens exactly once, 
+    // outside the loop, with a total length of 100 * 10 = 1000!
+    // CHECK: call i64 @write(i32 {{.*}}, ptr {{.*}}, i64 1000)
+    
+    // The loop body should contain no write calls.
+    // CHECK-NOT: call i64 @write
+    
+    for (int i = 0; i < 100; i++) {
+        write(fd, buf + (i * 10), 10);
+    }
+}

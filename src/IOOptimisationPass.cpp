@@ -7,6 +7,9 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/MemoryLocation.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include <vector>
 
 using namespace llvm;
@@ -168,6 +171,93 @@ namespace {
   }
 
   // -----------------------------------------------------------------------------
+  // Loop I/O amalgamation of non-unit stride accesses using SCEV
+  // -----------------------------------------------------------------------------
+  bool optimizeLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
+    // We need a Preheader (a basic block that executes exactly once before the loop)
+    // to safely insert our hoisted write call.
+    BasicBlock *Preheader = L->getLoopPreheader();
+    if (!Preheader) return false;
+
+    // Check if the loop has a known, constant number of iterations
+    unsigned TripCount = SE.getSmallConstantTripCount(L);
+    if (TripCount == 0) return false;
+
+    bool Changed = false;
+
+    // Scan the loop body for I/O calls
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : llvm::make_early_inc_range(*BB)) {
+	if (auto *Call = dyn_cast<CallInst>(&I)) {
+                
+	  Function *CalledFn = Call->getCalledFunction();
+	  if (!CalledFn || !CalledFn->hasName() || !CalledFn->isDeclaration()) continue;
+
+	  StringRef Name = CalledFn->getName();
+	  if (Name != "write" && Name != "fwrite") continue;
+
+	  IOArgs Args = getIOArguments(Call);
+                
+	  // We only handle constant write lengths for this optimization
+	  auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
+	  if (!ConstLen) continue;
+
+	  // Work out how the buffer pointer behaves across iterations.
+	  const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
+                
+	  // An AddRecExpr represents a value that changes by a constant "step" each iteration.
+	  // (e.g., ptr = ptr + step)
+	  const SCEVAddRecExpr *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV);
+                
+	  // Ensure the pointer actually increments based on THIS loop
+	  if (!AddRec || AddRec->getLoop() != L) continue;
+
+	  // Get the step amount (how much the pointer moves each loop)
+	  const SCEV *Step = AddRec->getStepRecurrence(SE);
+
+	  // If the pointer increments by the exact size of the write length, 
+	  // the writes form a perfectly contiguous block of memory.
+	  if (auto *StepConst = dyn_cast<SCEVConstant>(Step)) {
+	    if (StepConst->getValue()->getValue() == ConstLen->getValue()) {
+                        
+	      errs() << "SCEV proved loop I/O is contiguous! Unrolling...\n";
+
+	      // Calculate the new total length: TripCount * ConstLen
+	      uint64_t TotalLenBytes = TripCount * ConstLen->getZExtValue();
+                        
+	      // Find the base pointer (the value of the pointer on Iteration 0)
+	      Value *BasePtr = nullptr;
+	      if (auto *Unknown = dyn_cast<SCEVUnknown>(AddRec->getStart())) {
+		BasePtr = Unknown->getValue();
+	      } else {
+		continue; // Start pointer is too complex to easily extract
+	      }
+
+	      // Generate the amalgamated write in the Preheader
+	      IRBuilder<> Builder(Preheader->getTerminator());
+	      Value *NewLen = Builder.getInt64(TotalLenBytes);
+                        
+	      std::vector<Value *> NewArgs;
+	      if (Name == "fwrite") {
+		NewArgs = {BasePtr, Call->getArgOperand(1), NewLen, Args.Target};
+	      } else {
+		NewArgs = {Args.Target, BasePtr, NewLen};
+	      }
+
+	      Builder.CreateCall(CalledFn, NewArgs);
+
+	      // Delete the original small write from inside the loop
+	      Call->eraseFromParent();
+	      Changed = true;
+	    }
+	  }
+	}
+      }
+    }
+    return Changed;
+  }
+
+  // -----------------------------------------------------------------------------
   // Main pass
   // -----------------------------------------------------------------------------
   struct IOOptimizationPass : public PassInfoMixin<IOOptimizationPass> {
@@ -176,6 +266,16 @@ namespace {
       bool Changed = false;
       AAResults &AA = FAM.getResult<AAManager>(F);
       const DataLayout &DL = F.getParent()->getDataLayout();
+
+      LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+      ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+
+      // Run loop Aaalgamation first
+      for (Loop *L : LI) {
+	if (optimizeLoopIO(L, SE, DL)) {
+	  Changed = true;
+	}
+      }
 
       for (BasicBlock &BB : F) {
 	CallInst *LastWrite = nullptr;
