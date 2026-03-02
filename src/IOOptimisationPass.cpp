@@ -121,6 +121,15 @@ bool hoistRead(CallInst *ReadCall, AAResults &AA, const DataLayout &DL) {
     while (Prev) {
         if (Prev->isTerminator() || isa<PHINode>(Prev)) break;
 
+        bool DependsOnPrev = false;
+        for (Value *Op : ReadCall->operands()) {
+            if (Op == Prev) {
+                DependsOnPrev = true;
+                break;
+            }
+        }
+        if (DependsOnPrev) break;
+
         if (Prev->mayReadOrWriteMemory()) {
             ModRefInfo MR = AA.getModRefInfo(Prev, DestLoc);
             // If the previous instruction interferes with our buffer, we must stop here
