@@ -1,0 +1,9 @@
+import os
+
+# These variables are injected by CMake
+config.shlibdir = "@IO_BINARY_DIR@/src"
+config.shlibext = "@IO_SHLIB_EXT@"
+config.io_source_root = "@IO_SOURCE_DIR@"
+
+# Now load the actual tool logic from the main lit.cfg.py
+lit_config.load_config(config, "@IO_SOURCE_DIR@/tests/lit.cfg.py")

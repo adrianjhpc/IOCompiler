@@ -1,7 +1,15 @@
 import lit.formats
+import os
 
 config.name = "IOOptimisationPass Suite"
-# Use the shell test format (allows us to run pipeline commands)
 config.test_format = lit.formats.ShTest(True)
-# Look for files ending in .c and .cpp
-config.suffixes = ['.c','.cpp']
+config.suffixes = ['.c', '.cpp']
+
+config.environment['PATH'] = os.environ.get('PATH', '')
+if 'CPATH' in os.environ:
+    config.environment['CPATH'] = os.environ.get('CPATH')
+
+if hasattr(config, 'shlibdir'):
+    config.substitutions.append(('%shlibdir', config.shlibdir))
+if hasattr(config, 'shlibext'):
+    config.substitutions.append(('%shlibext', config.shlibext))

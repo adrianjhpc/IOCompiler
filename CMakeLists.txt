@@ -17,6 +17,18 @@ find_program(LIT_TOOL NAMES llvm-lit-20 lit-20 llvm-lit lit)
 if(LIT_TOOL)
     message(STATUS "Found lit test tool: ${LIT_TOOL}")
 
+    set(IO_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
+    set(IO_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+    set(IO_SHLIB_EXT ${CMAKE_SHARED_LIBRARY_SUFFIX})
+
+    # This creates a 'lit.site.cfg.py' in the build directory with real paths
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/lit.site.cfg.py.in
+	${CMAKE_CURRENT_SOURCE_DIR}/tests/lit.site.cfg.py
+        @ONLY
+    )
+
+
     # 2. Create a custom 'check' target
     add_custom_target(check
         # Run lit on the test/ directory, passing the -v (verbose) flag
