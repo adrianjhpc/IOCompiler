@@ -3,3 +3,4 @@ tests/Output
 tests/.lit_test_times.txt
 tests/lit.site.cfg.py
 testing
+*~

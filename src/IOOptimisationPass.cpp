@@ -308,6 +308,50 @@ namespace {
   };
 }
 
+// Heuristic injector pass
+// This pass scans the whole program before the inliner runs.
+// If it finds a small function that does I/O, it forces the compiler to inline it.
+// This is to try and expand lto optimisations to things that aren't inlined by heuristic.
+struct IOWrapperInlinePass : public PassInfoMixin<IOWrapperInlinePass> {
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
+        bool Changed = false;
+        
+        for (Function &F : M) {
+            // Skip external declarations
+            if (F.isDeclaration()) continue;
+
+            unsigned InstCount = 0;
+            bool HasIO = false;
+
+            // Analyze the function's contents
+            for (BasicBlock &BB : F) {
+                for (Instruction &I : BB) {
+                    InstCount++;
+                    if (auto *Call = dyn_cast<CallInst>(&I)) {
+                        if (Function *Callee = Call->getCalledFunction()) {
+                            StringRef Name = Callee->getName();
+                            // Does it call a write function?
+                            if (Name == "write" || Name == "writev" || Name == "fwrite") {
+                                HasIO = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If the function has fewer than 30 instructions 
+            // it contains an I/O call, it is a wrapper. Force it to inline!
+            if (HasIO && InstCount < 30 && !F.hasFnAttribute(Attribute::NoInline)) {
+                errs() << "[IOOpt-Injector] Tagging '" << F.getName() << "' for aggressive LTO inlining...\n";
+                F.addFnAttr(Attribute::AlwaysInline);
+                Changed = true;
+            }
+        }
+        
+        return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    }
+};
+
 // -----------------------------------------------------------------------------
 // Pass plugin registration
 // -----------------------------------------------------------------------------
@@ -316,7 +360,6 @@ llvmGetPassPluginInfo() {
     return {
         LLVM_PLUGIN_API_VERSION, "IOOpt", LLVM_VERSION_STRING,
         [](PassBuilder &PB) {
-            // Run via command line (opt -passes=io-opt)
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, FunctionPassManager &FPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
@@ -327,13 +370,21 @@ llvmGetPassPluginInfo() {
                     return false;
                 });
 
-            // Run at the end of the standard optimization pipeline
-            PB.registerOptimizerLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
-                    MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass()));
+            // Run at the start of the pipeline
+            PB.registerPipelineStartEPCallback(
+                [](ModulePassManager &MPM, OptimizationLevel Level) {
+                    MPM.addPass(IOWrapperInlinePass());
                 });
 
-            // Run during the Full Link-Time Optimization phase!
+            // Standard compile phase
+            PB.registerOptimizerLastEPCallback(
+                [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+                    if (Phase == ThinOrFullLTOPhase::None) {
+                        MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass()));
+                    }
+                });
+
+            // Full LTO link phase
             PB.registerFullLinkTimeOptimizationLastEPCallback(
                 [](ModulePassManager &MPM, OptimizationLevel Level) {
                     MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass()));
