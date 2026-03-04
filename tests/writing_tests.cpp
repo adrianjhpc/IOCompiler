@@ -19,9 +19,9 @@ NOINLINE void test_contiguous_write(int fd) {
 NOINLINE void test_non_contiguous_write(int fd) {
     char buf1[5] = "AAAA";
     char buf2[5] = "BBBB";
-    
-    // CHECK: %iovec.array = alloca [2 x { ptr, i64 }]
-    // CHECK: call {{.*}} @writev(i32 {{.*}}, ptr %iovec.array, i32 2)
+
+    // CHECK: %iovec.array.N = alloca [2 x { ptr, i64 }]
+    // CHECK: call {{.*}} @writev(i32 {{.*}}, ptr %iovec.array.N, i32 2)
     write(fd, buf1, 2);
     write(fd, buf2, 2);
 }

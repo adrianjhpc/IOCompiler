@@ -58,104 +58,127 @@ namespace {
     return false;
   }
 
-bool isSafeToAmalgamate(CallInst *Call1, CallInst *Call2, AAResults &AA, const DataLayout &DL) {
-    if (Call1->getCalledFunction() != Call2->getCalledFunction()) return false;
+  bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL) {
+    if (Batch.empty()) return true;
     
-    IOArgs Args1 = getIOArguments(Call1);
-    IOArgs Args2 = getIOArguments(Call2);
-    if (!Args1.Target || !Args2.Target) return false;
-
-    // --- SSA HARDENED TARGET CHECK ---
-    bool TargetsMatch = (Args1.Target == Args2.Target);
+    CallInst *LastCall = Batch.back();
+    if (LastCall->getCalledFunction() != NewCall->getCalledFunction()) return false;
+    
+    IOArgs FirstArgs = getIOArguments(Batch.front());
+    IOArgs NewArgs = getIOArguments(NewCall);
+    
+    // SSA Hardened Target Check
+    bool TargetsMatch = (FirstArgs.Target == NewArgs.Target);
     if (!TargetsMatch) {
-        // Under -O3, the same 'fd' might be loaded into two different SSA variables.
-        // Check if both targets are loads from the exact same memory allocation.
-        auto *Load1 = dyn_cast<LoadInst>(Args1.Target);
-        auto *Load2 = dyn_cast<LoadInst>(Args2.Target);
-        if (Load1 && Load2 && Load1->getPointerOperand() == Load2->getPointerOperand()) {
-            TargetsMatch = true;
-        }
+      auto *Load1 = dyn_cast<LoadInst>(FirstArgs.Target);
+      auto *Load2 = dyn_cast<LoadInst>(NewArgs.Target);
+      if (Load1 && Load2 && Load1->getPointerOperand() == Load2->getPointerOperand()) {
+	TargetsMatch = true;
+      }
     }
     if (!TargetsMatch) return false;
-    // ---------------------------------
 
     auto getPreciseLoc = [&](Value *Buf, Value *Len) {
-        if (auto *C = dyn_cast<ConstantInt>(Len)) {
-            return MemoryLocation(Buf, LocationSize::precise(C->getZExtValue()));
-        }
-        return MemoryLocation::getBeforeOrAfter(Buf);
+      if (auto *C = dyn_cast<ConstantInt>(Len))
+	return MemoryLocation(Buf, LocationSize::precise(C->getZExtValue()));
+      return MemoryLocation::getBeforeOrAfter(Buf);
     };
 
-    MemoryLocation Loc1 = getPreciseLoc(Args1.Buffer, Args1.Length);
-    MemoryLocation Loc2 = getPreciseLoc(Args2.Buffer, Args2.Length);
+    MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
 
-    for (Instruction *I = Call1->getNextNode(); I != Call2; I = I->getNextNode()) {
-        if (!I) return false; 
+    // Check all instructions between the last batched write and this new one
+    for (Instruction *I = LastCall->getNextNode(); I != NewCall; I = I->getNextNode()) {
+      if (!I) return false;
+      if (!I->mayReadOrWriteMemory()) continue;
         
-        // Skip purely mathematical operations (add, mul, etc.) injected by -O3
-        if (!I->mayReadOrWriteMemory()) continue;
+      // Does 'I' interfere with the new write's buffer?
+      if (isModOrRefSet(AA.getModRefInfo(I, NewLoc))) return false;
         
-        if (isModOrRefSet(AA.getModRefInfo(I, Loc1)) || isModOrRefSet(AA.getModRefInfo(I, Loc2))) {
-            return false;
-        }
+      // Does 'I' interfere with any buffer already in the batch?
+      for (CallInst *BatchedCall : Batch) {
+	IOArgs BArgs = getIOArguments(BatchedCall);
+	MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
+	if (isModOrRefSet(AA.getModRefInfo(I, BLoc))) return false;
+      }
     }
-    
-    return true; 
-}
-  
-    
-  void mergeWrites(CallInst *Call1, CallInst *Call2) {
-    IRBuilder<> Builder(Call2);
-    IOArgs Args1 = getIOArguments(Call1);
-    IOArgs Args2 = getIOArguments(Call2);
-    Value *NewLen = Builder.CreateAdd(Args1.Length, Args2.Length, "merged.io.len");
-    std::vector<Value *> NewArgs;
-    if (Args1.Type == IOArgs::C_FWRITE) {
-      NewArgs = {Args1.Buffer, Call1->getArgOperand(1), NewLen, Args1.Target};
-    } else {
-      NewArgs = {Args1.Target, Args1.Buffer, NewLen};
-    }
-    Builder.CreateCall(Call1->getCalledFunction(), NewArgs);
-    Call1->eraseFromParent();
-    Call2->eraseFromParent();
-    errs() << "[IOOpt] SUCCESS: Merged contiguous writes!\n";
+    return true;
   }
 
-  // ADDED: The writev logic as a standalone extension
-  void mergeWritesWithVectoredIO(CallInst *Call1, CallInst *Call2, Module *M) {
-    IRBuilder<> Builder(Call2);
-    IOArgs Args1 = getIOArguments(Call1);
-    IOArgs Args2 = getIOArguments(Call2);
+  bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
+    if (Batch.size() <= 1) {
+      Batch.clear();
+      return false;
+    }
+
     const DataLayout &DL = M->getDataLayout();
-
-    Type *Int32Ty = Builder.getInt32Ty();
-    Type *PtrTy = PointerType::getUnqual(M->getContext());
-    Type *SizeTy = DL.getIntPtrType(M->getContext());
+    bool AllContiguous = true;
     
-    FunctionType *WritevTy = FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty}, false);
-    FunctionCallee WritevFunc = M->getOrInsertFunction("writev", WritevTy);
-    StructType *IovecTy = StructType::get(M->getContext(), {PtrTy, SizeTy});
-    ArrayType *IovArrayTy = ArrayType::get(IovecTy, 2);
+    // Check if the entire chain is contiguous
+    for (size_t i = 0; i < Batch.size() - 1; ++i) {
+      IOArgs A = getIOArguments(Batch[i]);
+      IOArgs B = getIOArguments(Batch[i+1]);
+      if (!checkAdjacency(A.Buffer, A.Length, B.Buffer, DL)) {
+	AllContiguous = false;
+	break;
+      }
+    }
 
-    AllocaInst *IovArray = Builder.CreateAlloca(IovArrayTy, nullptr, "iovec.array");
+    IRBuilder<> Builder(Batch.back());
+    IOArgs FirstArgs = getIOArguments(Batch.front());
 
-    auto FillIov = [&](int Index, Value *Buf, Value *Len) {
-      Value *IovPtr = Builder.CreateInBoundsGEP(IovArrayTy, IovArray, {Builder.getInt32(0), Builder.getInt32(Index)});
-      Builder.CreateStore(Buf, Builder.CreateStructGEP(IovecTy, IovPtr, 0));
-      Builder.CreateStore(Builder.CreateIntCast(Len, SizeTy, false), Builder.CreateStructGEP(IovecTy, IovPtr, 1));
-    };
+    if (AllContiguous) {
+      // --- N-way contigious merge functionality
+      Value *TotalLen = FirstArgs.Length;
+      for (size_t i = 1; i < Batch.size(); ++i) {
+	TotalLen = Builder.CreateAdd(TotalLen, getIOArguments(Batch[i]).Length, "sum.len");
+      }
+        
+      std::vector<Value *> NewArgs;
+      if (FirstArgs.Type == IOArgs::C_FWRITE) {
+	NewArgs = {FirstArgs.Buffer, Batch[0]->getArgOperand(1), TotalLen, FirstArgs.Target};
+      } else {
+	NewArgs = {FirstArgs.Target, FirstArgs.Buffer, TotalLen};
+      }
+      Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
+      errs() << "[IOOpt] SUCCESS: N-Way merged " << Batch.size() << " contiguous writes!\n";
+        
 
-    FillIov(0, Args1.Buffer, Args1.Length);
-    FillIov(1, Args2.Buffer, Args2.Length);
-
-    Value *Fd = Builder.CreateIntCast(Args1.Target, Int32Ty, false);
-    Builder.CreateCall(WritevFunc, {Fd, IovArray, Builder.getInt32(2)});
-    Call1->eraseFromParent();
-    Call2->eraseFromParent();
-    errs() << "[IOOpt] SUCCESS: Converted separate writes to writev!\n";
+    } else {
+      // --- N-way writev (scatter/gather non-contigious) merge functionality
+      Type *Int32Ty = Builder.getInt32Ty();
+      Type *PtrTy = PointerType::getUnqual(M->getContext());
+      Type *SizeTy = DL.getIntPtrType(M->getContext());
+      
+      FunctionType *WritevTy = FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty}, false);
+      FunctionCallee WritevFunc = M->getOrInsertFunction("writev", WritevTy);
+      
+      StructType *IovecTy = StructType::get(M->getContext(), {PtrTy, SizeTy});
+      ArrayType *IovArrayTy = ArrayType::get(IovecTy, Batch.size());
+      
+      // Allocated the block before the loop
+      Function *F = Batch.back()->getFunction();
+      IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+      AllocaInst *IovArray = EntryBuilder.CreateAlloca(IovArrayTy, nullptr, "iovec.array.N");
+      
+      for (size_t i = 0; i < Batch.size(); ++i) {
+	IOArgs Args = getIOArguments(Batch[i]);
+	// Note: We still use 'Builder' here because we want the stores 
+	// to happen inside the loop, right before the writev call.
+	Value *IovPtr = Builder.CreateInBoundsGEP(IovArrayTy, IovArray, {Builder.getInt32(0), Builder.getInt32(i)});
+	Builder.CreateStore(Args.Buffer, Builder.CreateStructGEP(IovecTy, IovPtr, 0));
+	Builder.CreateStore(Builder.CreateIntCast(Args.Length, SizeTy, false), Builder.CreateStructGEP(IovecTy, IovPtr, 1));
+      }
+      
+      Value *Fd = Builder.CreateIntCast(FirstArgs.Target, Int32Ty, false);
+      Builder.CreateCall(WritevFunc, {Fd, IovArray, Builder.getInt32(Batch.size())});
+      errs() << "[IOOpt] SUCCESS: N-Way converted " << Batch.size() << " writes to writev!\n";
+    }
+        
+    for (CallInst *C : Batch) C->eraseFromParent();
+    Batch.clear();
+    return true;
   }
-
-  // REVERTED: Original hoistRead logic
+  
   bool hoistRead(CallInst *ReadCall, AAResults &AA, const DataLayout &DL) {
     IOArgs Args = getIOArguments(ReadCall);
     if (!Args.Buffer) return false;
@@ -192,7 +215,6 @@ bool isSafeToAmalgamate(CallInst *Call1, CallInst *Call2, AAResults &AA, const D
     return false;
   }
 
-  // REVERTED: Original loop optimization
   bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
     BasicBlock *Preheader = L->getLoopPreheader();
     if (!Preheader) return false;
@@ -240,27 +262,33 @@ bool isSafeToAmalgamate(CallInst *Call1, CallInst *Call2, AAResults &AA, const D
       for (Loop *L : LI) if (optimiseLoopIO(L, SE, DL)) Changed = true;
 
       for (BasicBlock &BB : F) {
-        CallInst *LastWrite = nullptr;
-        for (Instruction &I : llvm::make_early_inc_range(BB)) {
-          if (auto *Call = dyn_cast<CallInst>(&I)) {
+	std::vector<CallInst*> WriteBatch;
+
+	for (Instruction &I : llvm::make_early_inc_range(BB)) {
+	  if (auto *Call = dyn_cast<CallInst>(&I)) {
             IOArgs CArgs = getIOArguments(Call);
+            
             if (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::CXX_WRITE) {
-              if (LastWrite && isSafeToAmalgamate(LastWrite, Call, AA, DL)) {
-                IOArgs LArgs = getIOArguments(LastWrite);
-                if (checkAdjacency(LArgs.Buffer, LArgs.Length, CArgs.Buffer, DL)) mergeWrites(LastWrite, Call);
-                else mergeWritesWithVectoredIO(LastWrite, Call, F.getParent());
-                Changed = true;
-                LastWrite = nullptr;
-              } else {
-		LastWrite = Call;
-		errs() << "[IOOpt] FAILED: Unsafe to merge or intervening memory hazard.\n";
+	      if (isSafeToAddToBatch(WriteBatch, Call, AA, DL)) {
+		WriteBatch.push_back(Call);
+		// Prevent hardware limits (POSIX IOV_MAX)
+		if (WriteBatch.size() >= 1024) {
+		  if (flushBatch(WriteBatch, F.getParent())) Changed = true;
+		}
+	      } else {
+		// Hazard found so flush the current batch and start a new one
+		if (flushBatch(WriteBatch, F.getParent())) Changed = true;
+		WriteBatch.push_back(Call);
 	      }
             } else if (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD) {
-              if (hoistRead(Call, AA, DL)) Changed = true;
-              LastWrite = nullptr;
-            } else LastWrite = nullptr;
-          }
-        }
+	      // Reads flush the write buffer immediately
+	      if (flushBatch(WriteBatch, F.getParent())) Changed = true;
+	      if (hoistRead(Call, AA, DL)) Changed = true;
+            }
+	  }
+	}
+	// Flush anything left at the end of the BasicBlock
+	if (flushBatch(WriteBatch, F.getParent())) Changed = true;
       }
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
@@ -273,21 +301,20 @@ bool isSafeToAmalgamate(CallInst *Call1, CallInst *Call2, AAResults &AA, const D
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "IOOpt", LLVM_VERSION_STRING, [](PassBuilder &PB) {
     
-    // 1. Used by 'opt' in your lit tests
+    // Used by 'opt' in lit tests
     PB.registerPipelineParsingCallback([](StringRef Name, FunctionPassManager &FPM, ...) {
       if (Name == "io-opt") { FPM.addPass(IOOptimisationPass()); return true; }
       return false;
     });
 
-    // 2. Used by 'clang++ -O3' when building bench_fast
-    // We must include 'ThinOrFullLTOPhase Phase' to satisfy the LLVM 20 type checker
+    // Insert into optimisations levels
     PB.registerPipelineEarlySimplificationEPCallback(
-        [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
-          if (Level != OptimizationLevel::O0) {
-            FunctionPassManager FPM;
-            FPM.addPass(IOOptimisationPass());
-            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
-          }
-        });
+						     [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+						       if (Level != OptimizationLevel::O0) {
+							 FunctionPassManager FPM;
+							 FPM.addPass(IOOptimisationPass());
+							 MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+						       }
+						     });
   }};
 }
