@@ -1,3 +1,5 @@
+# File write benchmark
+
 # Standard -O3 Baseline
 add_executable(pixel_write_standard pixel_write_benchmark.cpp)
 target_compile_options(pixel_write_standard PRIVATE -O3)
@@ -15,6 +17,8 @@ target_compile_options(pixel_write_fast PRIVATE
 # Ensure bench_fast only builds after the plugin is ready
 add_dependencies(pixel_write_fast IOOpt)
 
+# HTTP Server benchmark
+
 #Standard -O3 Baseline
 add_executable(http_standard http_benchmark.cpp)
 target_compile_options(http_standard PRIVATE -O3 -fno-inline)
@@ -29,3 +33,14 @@ target_compile_options(http_fast PRIVATE
 )
 # Ensure the pass is built before compiling this benchmark
 add_dependencies(http_fast IOOpt)
+
+# Database WAL benchmark
+
+# Baseline
+add_executable(wal_standard database_wal_benchmark.cpp)
+target_compile_options(wal_standard PRIVATE -O3 -fno-inline)
+
+# Optimized
+add_executable(wal_fast database_wal_benchmark.cpp)
+target_compile_options(wal_fast PRIVATE -O3 -fno-inline -fpass-plugin=$<TARGET_FILE:IOOpt>)
+add_dependencies(wal_fast IOOpt)
