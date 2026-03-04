@@ -24,7 +24,7 @@ int main() {
     write(fd, header, strlen(header));
     
     // Write 2 & 3: Happen inside logger.cpp. 
-    // Without LTO, the compiler cannot merge these!
+    // Without LTO, the compiler cannot merge these
     write_payload(fd, "Cross-module LTO is working!");
 
     return 0;
