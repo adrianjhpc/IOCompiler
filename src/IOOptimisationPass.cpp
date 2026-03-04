@@ -118,13 +118,22 @@ namespace {
       IOArgs A = getIOArguments(Batch[i]);
       IOArgs B = getIOArguments(Batch[i+1]);
       if (!checkAdjacency(A.Buffer, A.Length, B.Buffer, DL)) {
-	AllContiguous = false;
-	break;
+        AllContiguous = false;
+        break;
       }
     }
 
-    IRBuilder<> Builder(Batch.back());
     IOArgs FirstArgs = getIOArguments(Batch.front());
+    
+    // writev() is a raw OS system call. It requires an 'int fd'.
+    // We cannot use it on C FILE* or C++ std::ostream pointers!
+    if (!AllContiguous && FirstArgs.Type != IOArgs::POSIX_WRITE) {
+        Batch.clear();
+        return false;
+    }
+    // --------------------------------------------------
+
+    IRBuilder<> Builder(Batch.back());
 
     if (AllContiguous) {
       // --- N-way contigious merge functionality
@@ -269,6 +278,10 @@ namespace {
             IOArgs CArgs = getIOArguments(Call);
             
             if (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::CXX_WRITE) {
+	      if (!Call->use_empty()) {
+		if (flushBatch(WriteBatch, F.getParent())) Changed = true;
+		continue; 
+	      }	      
 	      if (isSafeToAddToBatch(WriteBatch, Call, AA, DL)) {
 		WriteBatch.push_back(Call);
 		// Prevent hardware limits (POSIX IOV_MAX)
