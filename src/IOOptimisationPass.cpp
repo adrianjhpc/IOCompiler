@@ -357,37 +357,36 @@ struct IOWrapperInlinePass : public PassInfoMixin<IOWrapperInlinePass> {
 // -----------------------------------------------------------------------------
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
-    return {
-        LLVM_PLUGIN_API_VERSION, "IOOpt", LLVM_VERSION_STRING,
-        [](PassBuilder &PB) {
-            PB.registerPipelineParsingCallback(
-                [](StringRef Name, FunctionPassManager &FPM,
-                   ArrayRef<PassBuilder::PipelineElement>) {
-                    if (Name == "io-opt") {
-                        FPM.addPass(IOOptimisationPass());
-                        return true;
-                    }
-                    return false;
-                });
-
-            // Run at the start of the pipeline
-            PB.registerPipelineStartEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel Level) {
-                    MPM.addPass(IOWrapperInlinePass());
-                });
-
-            // Standard compile phase
-            PB.registerOptimizerLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
-                    if (Phase == ThinOrFullLTOPhase::None) {
-                        MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass()));
-                    }
-                });
-
-            // Full LTO link phase
-            PB.registerFullLinkTimeOptimizationLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel Level) {
-                    MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass()));
-                });
-        }};
+  return {
+    LLVM_PLUGIN_API_VERSION, "IOOpt", LLVM_VERSION_STRING,
+    [](PassBuilder &PB) {
+      // Register pass for -passes=io-opt
+      PB.registerPipelineParsingCallback(
+        [](StringRef Name, FunctionPassManager &FPM,
+	   ArrayRef<PassBuilder::PipelineElement>) {
+	  if (Name == "io-opt") {
+	    FPM.addPass(IOOptimisationPass());
+	    return true;
+	  }
+	  return false;
+	});
+      
+      // Look for inline potential to enable later LTO optimisation
+      PB.registerPipelineStartEPCallback(
+        [](ModulePassManager &MPM, OptimizationLevel Level) {
+	  MPM.addPass(IOWrapperInlinePass());
+	});
+      
+      // Standard optimiser
+      PB.registerOptimizerLastEPCallback(
+        [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+	  MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass()));
+	});
+      
+      // 4. LTO optimisation
+      PB.registerFullLinkTimeOptimizationLastEPCallback(
+        [](ModulePassManager &MPM, OptimizationLevel Level) {
+	  MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass()));
+	});
+    }};
 }
