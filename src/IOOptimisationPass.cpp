@@ -58,7 +58,7 @@ namespace {
     return false;
   }
 
-  bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL) {
+bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL) {
     if (Batch.empty()) return true;
     
     CallInst *LastCall = Batch.back();
@@ -67,7 +67,6 @@ namespace {
     IOArgs FirstArgs = getIOArguments(Batch.front());
     IOArgs NewArgs = getIOArguments(NewCall);
     
-    // SSA Hardened Target Check
     bool TargetsMatch = (FirstArgs.Target == NewArgs.Target);
     if (!TargetsMatch) {
       auto *Load1 = dyn_cast<LoadInst>(FirstArgs.Target);
@@ -90,18 +89,27 @@ namespace {
       if (!I) return false;
       if (!I->mayReadOrWriteMemory()) continue;
         
-      if (isModOrRefSet(AA.getModRefInfo(I, NewLoc))) return false;
+      // THE FIX: We only abort if an instruction MODIFIES (isModSet) the buffer.
+      // Intervening reads (Ref) are perfectly safe!
+      if (isModSet(AA.getModRefInfo(I, NewLoc))) return false;
         
       for (CallInst *BatchedCall : Batch) {
         IOArgs BArgs = getIOArguments(BatchedCall);
         MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
-        if (isModOrRefSet(AA.getModRefInfo(I, BLoc))) return false;
+        if (isModSet(AA.getModRefInfo(I, BLoc))) return false;
+      }
+
+      // Ensure the Target (like the FILE* struct) isn't modified
+      if (FirstArgs.Target->getType()->isPointerTy()) {
+          MemoryLocation TargetLoc(FirstArgs.Target, LocationSize::beforeOrAfterPointer());
+          if (isModSet(AA.getModRefInfo(I, TargetLoc))) return false;
       }
     }
     return true;
   }
+  
 
-  bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
+bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
     if (Batch.size() <= 1) {
       Batch.clear();
       return false;
@@ -127,13 +135,24 @@ namespace {
         return false;
     }
 
-    // ====================================================================
-    // PROFITABILITY HEURISTIC
-    // Setting up an iovec array is expensive. Only perform non-contiguous
-    // vector merging if we are eliminating at least 2 system calls (batch >= 3).
-    // Contiguous merges avoid this entirely, so 2-way is fine for them.
-    // ====================================================================
-    if (!AllContiguous && Batch.size() < 3) {
+    // --- SHADOW BUFFERING CHECK ---
+    // If we have exactly 2 scattered writes with known, small constant sizes,
+    // we can merge them by copying them into a local stack buffer!
+    bool CanShadowBuffer = false;
+    uint64_t TotalConstSize = 0;
+    if (!AllContiguous && Batch.size() == 2 && !isRead) {
+        auto *C1 = dyn_cast<ConstantInt>(getIOArguments(Batch[0]).Length);
+        auto *C2 = dyn_cast<ConstantInt>(getIOArguments(Batch[1]).Length);
+        if (C1 && C2) {
+            TotalConstSize = C1->getZExtValue() + C2->getZExtValue();
+            if (TotalConstSize > 0 && TotalConstSize <= 4096) { // Max 4KB on stack
+                CanShadowBuffer = true;
+            }
+        }
+    }
+
+    // Heuristic: Must be contiguous, N>=3 for vector, or eligible for Shadow Buffering
+    if (!AllContiguous && Batch.size() < 3 && !CanShadowBuffer) {
         Batch.clear();
         return false;
     }
@@ -155,6 +174,36 @@ namespace {
       Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
       errs() << "[IOOpt] SUCCESS: N-Way merged " << Batch.size() << " contiguous " << (isRead ? "reads" : "writes") << "!\n";
         
+    } else if (CanShadowBuffer) {
+      // ====================================================================
+      // SHADOW BUFFERING EXECUTION
+      // ====================================================================
+      Function *F = Batch.back()->getFunction();
+      IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+      
+      Type *Int8Ty = Builder.getInt8Ty();
+      ArrayType *ShadowArrTy = ArrayType::get(Int8Ty, TotalConstSize);
+      AllocaInst *ShadowBuf = EntryBuilder.CreateAlloca(ShadowArrTy, nullptr, "shadow.buf");
+      
+      uint64_t Offset = 0;
+      for (size_t i = 0; i < Batch.size(); ++i) {
+        IOArgs Args = getIOArguments(Batch[i]);
+        uint64_t Len = cast<ConstantInt>(Args.Length)->getZExtValue();
+        Value *DestPtr = Builder.CreateInBoundsGEP(ShadowArrTy, ShadowBuf, {Builder.getInt32(0), Builder.getInt32(Offset)});
+        Builder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
+        Offset += Len;
+      }
+      
+      Value *TotalLenVal = Builder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), TotalConstSize);
+      std::vector<Value *> NewArgs;
+      if (FirstArgs.Type == IOArgs::C_FWRITE) {
+        NewArgs = {ShadowBuf, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
+      } else {
+        NewArgs = {FirstArgs.Target, ShadowBuf, TotalLenVal};
+      }
+      Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
+      errs() << "[IOOpt] SUCCESS: Shadow Buffered 2 writes into 1 (" << TotalConstSize << " bytes)!\n";
+
     } else {
       Type *Int32Ty = Builder.getInt32Ty();
       Type *PtrTy = PointerType::getUnqual(M->getContext());
@@ -188,6 +237,7 @@ namespace {
     Batch.clear();
     return true;
   }
+  
   
   bool hoistRead(CallInst *ReadCall, AAResults &AA, const DataLayout &DL) {
     IOArgs Args = getIOArguments(ReadCall);
