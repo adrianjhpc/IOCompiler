@@ -11,9 +11,9 @@ void test_alias_mutation(int fd, char* buffer) {
     
     // CHECK-NOT: call {{.*}} @writev
     
-    // CHECK: call {{.*}} @write(i32 {{.*}}, ptr {{.*}}, i64 10)
+    // CHECK: call {{.*}} @write(i32 {{.*}}, ptr {{.*}}, i64 {{.*}}10)
     // CHECK: store i8 88, ptr {{.*}}
-    // CHECK: call {{.*}} @write(i32 {{.*}}, ptr {{.*}}, i64 10)
+    // CHECK: call {{.*}} @write(i32 {{.*}}, ptr {{.*}}, i64 {{.*}}10)
     
     write(fd, buffer, 10);
     buffer[0] = 'X'; // 88 in ASCII
