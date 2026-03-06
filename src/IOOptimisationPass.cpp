@@ -135,6 +135,7 @@ namespace {
   // ====================================================================
   enum class IOPattern {
     Contiguous,   // Perfectly sequential memory (array[0], array[1])
+    Strided,      // Uniform scattered sizes perfect for SIMD Gather
     ShadowBuffer, // Small scattered writes we can safely pack on the stack
     Vectored,     // Heavy scattered I/O (Requires readv/writev arrays)
     Unprofitable  // Too few calls or lacks byte-weight. Do not optimise
@@ -166,6 +167,35 @@ namespace {
       return IOPattern::Unprofitable;
     }
 
+    // Pattern B: Check for the Strided Pattern (Uniform sizes for SIMD)
+    bool isStrided = false;
+    uint64_t UniformSize = 0;
+    
+    if (!isRead && Batch.size() > 1) {
+        if (auto *FirstSizeC = dyn_cast<ConstantInt>(getIOArguments(Batch.front()).Length)) {
+            UniformSize = FirstSizeC->getZExtValue();
+            // Only attempt SIMD gather for standard primitive sizes (e.g., 32-bit or 64-bit fields)
+            if (UniformSize == 1 || UniformSize == 2 || UniformSize == 4 || UniformSize == 8) {
+                isStrided = true;
+                for (CallInst *C : Batch) {
+                    auto *SizeC = dyn_cast<ConstantInt>(getIOArguments(C).Length);
+                    if (!SizeC || SizeC->getZExtValue() != UniformSize) {
+                        isStrided = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (isStrided) {
+        OutTotalConstSize = UniformSize; // Pass the uniform element size to the router
+        // Profitability Check: Gathering into a vector is highly profitable if we have >= 4 elements
+        if (Batch.size() >= 4 && Batch.size() <= 64) {
+            return IOPattern::Strided;
+        }
+    }
+
     // Evaluate dynamic sizes and byte-weight
     size_t DynamicThreshold = IOBatchThreshold; 
     uint64_t TotalConstSize = 0;
@@ -191,17 +221,17 @@ namespace {
       if (AllSizesConstant && TotalConstSize > 128) DynamicThreshold = 3;
     }
 
-    // Pattern B: Vectored I/O (Meets the strict profitable threshold)
+    // Pattern C: Vectored I/O (Meets the strict profitable threshold)
     if (Batch.size() >= DynamicThreshold) {
       return IOPattern::Vectored;
     }
 
-    // Pattern C: Shadow Buffer (Fails vectored threshold, but small enough to pack manually)
+    // Pattern D: Shadow Buffer (Fails vectored threshold, but small enough to pack manually)
     if (!isRead && AllSizesConstant && TotalConstSize > 0 && TotalConstSize <= IOShadowBufferSize) {
       return IOPattern::ShadowBuffer;
     }
 
-    // Pattern D: Not profitable
+    // Pattern E: Not profitable
     return IOPattern::Unprofitable;
   }
 
@@ -242,6 +272,52 @@ namespace {
         }
         Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
         errs() << "[IOOpt] SUCCESS: N-Way merged " << Batch.size() << " contiguous " << (isRead ? "reads" : "writes") << "!\n";
+        break;
+      }
+
+      case IOPattern::Strided: {
+        // TotalConstSize here holds the size of ONE element (e.g., 4 bytes)
+        unsigned ElementBytes = TotalConstSize;
+        unsigned NumElements = Batch.size();
+        
+        // Define the LLVM Types for the SIMD Vector
+        Type *ElementTy = Builder.getIntNTy(ElementBytes * 8); // e.g., i32
+        auto *VecTy = FixedVectorType::get(ElementTy, NumElements);
+        
+        // Start with an empty (poison) vector register
+        Value *GatherVec = PoisonValue::get(VecTy);
+        
+        // Gather the scattered data into the CPU vector register!
+        for (unsigned i = 0; i < NumElements; ++i) {
+            IOArgs Args = getIOArguments(Batch[i]);
+            Value *DataPtr = Args.Buffer;
+            // Load the single struct field
+            LoadInst *LoadedVal = Builder.CreateLoad(ElementTy, DataPtr, "strided.load");
+            // Insert it into the vector register
+            GatherVec = Builder.CreateInsertElement(GatherVec, LoadedVal, Builder.getInt32(i), "gather.insert");
+        }
+        
+        // Allocate a perfectly sized contiguous buffer on the stack
+        Function *F = Batch.back()->getFunction();
+        IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+        AllocaInst *ContiguousBuf = EntryBuilder.CreateAlloca(VecTy, nullptr, "simd.shadow.buf");
+        
+        // Store the entire vector register to the stack in one instruction
+        Builder.CreateStore(GatherVec, ContiguousBuf);
+        
+        // Issue a single write() system call for the entire batch
+        Value *TotalLenVal = Builder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), ElementBytes * NumElements);
+        Value *BufCast = Builder.CreatePointerCast(ContiguousBuf, Builder.getPtrTy());
+        
+        std::vector<Value *> NewArgs;
+        if (FirstArgs.Type == IOArgs::C_FWRITE) {
+            NewArgs = {BufCast, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
+        } else {
+            NewArgs = {FirstArgs.Target, BufCast, TotalLenVal};
+        }
+        Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
+        
+        errs() << "[IOOpt] SUCCESS: SIMD Gathered " << NumElements << " strided writes into 1!\n";
         break;
       }
 
