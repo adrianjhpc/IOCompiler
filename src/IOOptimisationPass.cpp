@@ -433,40 +433,101 @@ namespace {
     return false;
   }
 
-  bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
-    BasicBlock *Preheader = L->getLoopPreheader();
-    if (!Preheader) return false;
-    unsigned TripCount = SE.getSmallConstantTripCount(L);
-    if (TripCount == 0) return false;
-    bool Changed = false;
-    SCEVExpander Expander(SE, DL, "io.expander");
-    for (BasicBlock *BB : L->blocks()) {
-      for (Instruction &I : llvm::make_early_inc_range(*BB)) {
-        if (auto *Call = dyn_cast<CallInst>(&I)) {
-          IOArgs Args = getIOArguments(Call);
-          if (Args.Type != IOArgs::POSIX_WRITE && Args.Type != IOArgs::C_FWRITE) continue;
-          if (!L->isLoopInvariant(Args.Target)) continue;
-          auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
-          if (!ConstLen) continue;
-          const SCEVAddRecExpr *AddRec = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(Args.Buffer));
-          if (!AddRec || AddRec->getLoop() != L) continue;
-          const SCEVConstant *Step = dyn_cast<SCEVConstant>(AddRec->getStepRecurrence(SE));
-          if (Step && Step->getValue()->getValue() == ConstLen->getValue()) {
-            Value *BasePtr = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), Preheader->getTerminator());
-            IRBuilder<> Builder(Preheader->getTerminator());
-            Value *NewLen = Builder.getIntN(Args.Length->getType()->getIntegerBitWidth(), TripCount * ConstLen->getZExtValue());
-            std::vector<Value *> NewArgs;
-            if (Args.Type == IOArgs::C_FWRITE) NewArgs = {BasePtr, Call->getArgOperand(1), NewLen, Args.Target};
-            else NewArgs = {Args.Target, BasePtr, NewLen};
-            Builder.CreateCall(Call->getCalledFunction(), NewArgs);
-            Call->eraseFromParent();
-            Changed = true;
+  // ====================================================================
+    // PHASE 1: LOOP-EXIT (LAZY) FLUSHING (Hardened for LCSSA)
+    // ====================================================================
+    bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
+      // 1. We need the Exit block (to drop the new I/O) and the Preheader (to setup pointers)
+      BasicBlock *ExitBB = L->getExitBlock();
+      BasicBlock *Preheader = L->getLoopPreheader();
+      if (!ExitBB || !Preheader) return false;
+
+      // 2. Ask SCEV exactly how many times this loop will run.
+      unsigned TripCount = SE.getSmallConstantTripCount(L);
+      if (TripCount == 0) return false;
+
+      bool LoopChanged = false;
+
+      for (BasicBlock *BB : L->blocks()) {
+        for (Instruction &I : llvm::make_early_inc_range(*BB)) {
+          if (auto *Call = dyn_cast<CallInst>(&I)) {
+            IOArgs Args = getIOArguments(Call);
+            
+            if (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_READ || 
+                Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
+                
+              auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
+              if (!ConstLen) continue;
+
+              uint64_t ElementSize = ConstLen->getZExtValue();
+              uint64_t TotalBytes = ElementSize * TripCount;
+
+              if (TotalBytes > IOHighWaterMark) continue;
+
+              // ==========================================================
+              // CRASH FIX: LCSSA & Dominator Protection
+              // ==========================================================
+              
+              // Rule 1: The File Descriptor / Stream MUST not change during the loop
+              if (!L->isLoopInvariant(Args.Target)) continue;
+
+              // Rule 2: Extra arguments (like `size` in C_FWRITE) MUST not change
+              Value *ExtraArg = nullptr;
+              if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
+                  ExtraArg = Call->getArgOperand(1);
+                  if (!L->isLoopInvariant(ExtraArg)) continue; 
+              }
+
+              // Rule 3: Safely Trace the Memory Pointer using SCEV!
+              const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
+              Value *BasePointer = nullptr;
+
+              if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
+                  // It's a sequential array traversal! (e.g., ptr++ each loop)
+                  if (AddRec->getLoop() == L) {
+                      // Verify the pointer strides forward by exactly the ElementSize
+                      if (auto *StepConst = dyn_cast<SCEVConstant>(AddRec->getStepRecurrence(SE))) {
+                          if (StepConst->getValue()->getZExtValue() == ElementSize) {
+                              // Expand the starting pointer safely into the Preheader!
+                              SCEVExpander Expander(SE, DL, "io.base.expander");
+                              BasePointer = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), Preheader->getTerminator());
+                          }
+                      }
+                  }
+              } else if (SE.isLoopInvariant(PtrSCEV, L)) {
+                  // The pointer never moves during the loop
+                  BasePointer = Args.Buffer; 
+              }
+
+              // If we couldn't prove the pointer math is perfectly sequential and safe, ABORT!
+              if (!BasePointer) continue;
+
+              // ==========================================================
+              // THE TRANSFORMATION
+              // ==========================================================
+              IRBuilder<> ExitBuilder(&*ExitBB->getFirstInsertionPt());
+              Value *TotalLenVal = ExitBuilder.getIntN(Args.Length->getType()->getIntegerBitWidth(), TotalBytes);
+              
+              std::vector<Value *> NewArgs;
+              if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
+                NewArgs = {BasePointer, ExtraArg, TotalLenVal, Args.Target};
+              } else {
+                NewArgs = {Args.Target, BasePointer, TotalLenVal};
+              }
+
+              ExitBuilder.CreateCall(Call->getCalledFunction(), NewArgs);
+
+              errs() << "[IOOpt] SUCCESS: Hoisted Loop I/O! Scaled " << ElementSize 
+                     << " bytes * " << TripCount << " iterations = " << TotalBytes << " bytes at loop exit.\n";
+
+              Call->eraseFromParent();
+              LoopChanged = true;
+            }
           }
         }
       }
+      return LoopChanged;
     }
-    return Changed;
-  }
 
   bool sinkWrite(CallInst *WriteCall, AAResults &AA, const DataLayout &DL) {
 
@@ -514,56 +575,75 @@ namespace {
     IOOptimisationPass() {}
 
     // ====================================================================
-    // PHASE 1: LOOP-EXIT (LAZY) FLUSHING
+    // PHASE 1: LOOP-EXIT (LAZY) FLUSHING (Hardened for LCSSA)
     // ====================================================================
     bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
-      // 1. We need a guaranteed exit block to drop our batched write into.
+      // 1. We need the Exit block (to drop the new I/O) and the Preheader (to safely setup pointers)
       BasicBlock *ExitBB = L->getExitBlock();
-      if (!ExitBB) return false;
+      BasicBlock *Preheader = L->getLoopPreheader();
+      if (!ExitBB || !Preheader) return false;
 
-      // 2. Ask SCEV exactly how many times this loop will run.
       unsigned TripCount = SE.getSmallConstantTripCount(L);
       if (TripCount == 0) return false;
 
       bool LoopChanged = false;
 
-      // 3. Scan the loop for I/O instructions
       for (BasicBlock *BB : L->blocks()) {
         for (Instruction &I : llvm::make_early_inc_range(*BB)) {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
             IOArgs Args = getIOArguments(Call);
             
-            if (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_READ || 
-                Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
+            // ARCHITECTURE FIX: Only hoist unbuffered POSIX syscalls!
+            // C_FWRITE (fwrite) is already buffered by libc. Hoisting it 
+            // breaks internal stream state and causes LCSSA dominance errors.
+            if (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_READ) {
                 
               auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
-              if (!ConstLen) continue; // Can only scale static payload sizes
+              if (!ConstLen) continue;
 
-              // Calculate the total bytes this loop will write/read across all iterations
               uint64_t ElementSize = ConstLen->getZExtValue();
               uint64_t TotalBytes = ElementSize * TripCount;
 
-              // High-Water Mark protection for massive loops!
               if (TotalBytes > IOHighWaterMark) continue;
 
-              // 4. THE TRANSFORMATION: Lazy Loop-Exit Hoisting!
-              IRBuilder<> ExitBuilder(&*ExitBB->getFirstInsertionPt());
-              Value *BasePointer = Args.Buffer; 
-              Value *TotalLenVal = ExitBuilder.getIntN(Args.Length->getType()->getIntegerBitWidth(), TotalBytes);
-              
-              std::vector<Value *> NewArgs;
-              if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
-                NewArgs = {Args.Buffer, Call->getArgOperand(1), TotalLenVal, Args.Target};
-              } else {
-                NewArgs = {Args.Target, BasePointer, TotalLenVal};
+              // Rule 1: The File Descriptor MUST be safely outside the loop
+              if (!L->isLoopInvariant(Args.Target)) continue;
+
+              // Rule 2: Safely Trace and Materialize the Memory Pointer!
+              const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
+              Value *BasePointer = nullptr;
+
+              if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
+                  if (AddRec->getLoop() == L) {
+                      if (auto *StepConst = dyn_cast<SCEVConstant>(AddRec->getStepRecurrence(SE))) {
+                          if (StepConst->getValue()->getZExtValue() == ElementSize) {
+                              // Expand the starting pointer safely into the Preheader!
+                              SCEVExpander Expander(SE, DL, "io.base.expander");
+                              BasePointer = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), Preheader->getTerminator());
+                          }
+                      }
+                  }
+              } else if (SE.isLoopInvariant(PtrSCEV, L)) {
+                  // CRITICAL FIX: Even if the math is invariant, force materialization 
+                  // in the Preheader to guarantee it physically dominates the ExitBB!
+                  SCEVExpander Expander(SE, DL, "io.base.expander");
+                  BasePointer = Expander.expandCodeFor(PtrSCEV, Args.Buffer->getType(), Preheader->getTerminator());
               }
 
+              if (!BasePointer) continue;
+
+              // ==========================================================
+              // THE TRANSFORMATION
+              // ==========================================================
+              IRBuilder<> ExitBuilder(&*ExitBB->getFirstInsertionPt());
+              Value *TotalLenVal = ExitBuilder.getIntN(Args.Length->getType()->getIntegerBitWidth(), TotalBytes);
+              
+              std::vector<Value *> NewArgs = {Args.Target, BasePointer, TotalLenVal};
               ExitBuilder.CreateCall(Call->getCalledFunction(), NewArgs);
 
-              errs() << "[IOOpt] SUCCESS: Hoisted Loop I/O! Scaled " << ElementSize 
+              errs() << "[IOOpt] SUCCESS: Hoisted Loop POSIX I/O! Scaled " << ElementSize 
                      << " bytes * " << TripCount << " iterations = " << TotalBytes << " bytes at loop exit.\n";
 
-              // 5. Erase the slow I/O call from inside the loop!
               Call->eraseFromParent();
               LoopChanged = true;
             }
