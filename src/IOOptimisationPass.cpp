@@ -20,64 +20,90 @@ using namespace llvm;
 
 // Expose tunable parameters to the command line
 static cl::opt<unsigned> IOBatchThreshold(
-    "io-batch-threshold", 
-    cl::desc("Minimum number of scattered I/O operations to trigger writev"), 
-    cl::init(4));
+					  "io-batch-threshold", 
+					  cl::desc("Minimum number of scattered I/O operations to trigger writev"), 
+					  cl::init(4));
 
 static cl::opt<unsigned> IOShadowBufferSize(
-    "io-shadow-buffer-max", 
-    cl::desc("Maximum bytes to allocate on the stack for shadow buffering"), 
-    cl::init(4096));
+					    "io-shadow-buffer-max", 
+					    cl::desc("Maximum bytes to allocate on the stack for shadow buffering"), 
+					    cl::init(4096));
 static cl::opt<unsigned> IOHighWaterMark(
-    "io-high-water-mark", 
-    cl::desc("Maximum cumulative bytes before forcing a pipeline flush (default 64KB)"), 
-    cl::init(65536), // 64 KB
-    cl::Hidden);
+					 "io-high-water-mark", 
+					 cl::desc("Maximum cumulative bytes before forcing a pipeline flush (default 64KB)"), 
+					 cl::init(65536), // 64 KB
+					 cl::Hidden);
 
 namespace {
 
   struct IOArgs {
-    Value *Target; 
-    Value *Buffer; 
-    Value *Length; 
-    enum { NONE, C_FWRITE, C_FREAD, POSIX_WRITE, POSIX_READ, CXX_WRITE, CXX_READ } Type;
+    Value *Target = nullptr;
+    Value *Buffer = nullptr;
+    Value *Length = nullptr; 
+    enum { POSIX_READ, POSIX_WRITE, C_FREAD, C_FWRITE, CXX_WRITE, POSIX_PREAD, POSIX_PWRITE, NONE } Type = NONE;
+    Value *Offset = nullptr;
   };
 
   IOArgs getIOArguments(CallInst *Call) {
     Function *F = Call->getCalledFunction();
-    if (!F || !F->hasName() || !F->isDeclaration()) return {nullptr, nullptr, nullptr, IOArgs::NONE};
+    if (!F || !F->hasName() || !F->isDeclaration()) return {nullptr, nullptr, nullptr, IOArgs::NONE, nullptr};
 
     std::string Demangled = llvm::demangle(F->getName().str());
-    
-    if (Demangled == "fwrite") return {Call->getArgOperand(3), Call->getArgOperand(0), Call->getArgOperand(2), IOArgs::C_FWRITE};
-    if (Demangled == "fread")  return {Call->getArgOperand(3), Call->getArgOperand(0), Call->getArgOperand(2), IOArgs::C_FREAD};
-    if (Demangled == "write")  return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_WRITE};
-    if (Demangled == "read")   return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_READ};
 
-    if ((Demangled.find("std::basic_ostream") != std::string::npos || 
-         Demangled.find("std::ostream") != std::string::npos) && Demangled.find("::write") != std::string::npos) {
-      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::CXX_WRITE};
-    }
+    // Standard buffered I/O (no explicit offset)
+    if (Demangled == "fwrite") return {Call->getArgOperand(3), Call->getArgOperand(0), Call->getArgOperand(2), IOArgs::C_FWRITE, nullptr};
+    if (Demangled == "fread")  return {Call->getArgOperand(3), Call->getArgOperand(0), Call->getArgOperand(2), IOArgs::C_FREAD, nullptr};
     
-    return {nullptr, nullptr, nullptr, IOArgs::NONE};
+    // Standard POSIX I/O (no explicit offset)
+    if (Demangled == "write")  return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_WRITE, nullptr};
+    if (Demangled == "read")   return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_READ, nullptr};
+
+    // Explicit-Offset POSIX I/O (Grabs the 4th argument: index 3)
+    if (Demangled == "pwrite" || Demangled == "pwrite64") {
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PWRITE, Call->getArgOperand(3)};
+    }
+    if (Demangled == "pread" || Demangled == "pread64") {
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PREAD, Call->getArgOperand(3)};
+    }
+
+    // C++ Ostream
+    if ((Demangled.find("std::basic_ostream") != std::string::npos ||
+         Demangled.find("std::ostream") != std::string::npos) && Demangled.find("::write") != std::string::npos) {
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::CXX_WRITE, nullptr};
+    }
+
+    return {nullptr, nullptr, nullptr, IOArgs::NONE, nullptr};
   }
 
-  bool checkAdjacency(Value *Buf1, Value *Size1, Value *Buf2, const DataLayout &DL) {
-    if (auto *GEP = dyn_cast<GEPOperator>(Buf2)) {
-      if (GEP->getPointerOperand() == Buf1) {
-        APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
-        if (GEP->accumulateConstantOffset(DL, Offset)) {
-          if (auto *ConstSize1 = dyn_cast<ConstantInt>(Size1)) {
-            if (Offset == ConstSize1->getValue()) return true; 
-          }
-        }
+
+  bool checkAdjacency(Value *BufA, Value *LenA, Value *BufB, const DataLayout &DL, ScalarEvolution *SE = nullptr) {
+    // If we have SCEV, use it for algebraic adjacency checking
+    if (SE) {
+      const SCEV *A = SE->getSCEV(BufA);
+      const SCEV *Len = SE->getSCEV(LenA);
+      const SCEV *B = SE->getSCEV(BufB);
+
+      const SCEV *ExtendedLen = SE->getTruncateOrZeroExtend(Len, A->getType());
+      const SCEV *ExpectedB = SE->getAddExpr(A, ExtendedLen);
+      return ExpectedB == B;
+    }
+
+    // Fallback for when SE isn't passed 
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(BufB)) {
+      // Check if the second buffer is an offset of the first buffer
+      if (GEP->getPointerOperand() == BufA) {
+	if (auto *Offset = dyn_cast<ConstantInt>(GEP->getOperand(1))) {
+	  if (auto *LenConst = dyn_cast<ConstantInt>(LenA)) {
+	    // Check if they are contigious
+	    return Offset->getZExtValue() == LenConst->getZExtValue();
+	  }
+	}
       }
     }
     return false;
   }
 
-
-  bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL) {
+  bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL, ScalarEvolution &SE) {    
     if (Batch.empty()) return true;
 
     CallInst *LastCall = Batch.back();
@@ -85,8 +111,8 @@ namespace {
 
     IOArgs FirstArgs = getIOArguments(Batch.front());
     IOArgs NewArgs = getIOArguments(NewCall);
+    IOArgs LastArgs = getIOArguments(LastCall);
 
-    // 1. Target Matching Logic
     bool TargetsMatch = (FirstArgs.Target == NewArgs.Target);
     LoadInst *Load1 = dyn_cast<LoadInst>(FirstArgs.Target);
     LoadInst *Load2 = dyn_cast<LoadInst>(NewArgs.Target);
@@ -98,6 +124,49 @@ namespace {
     }
     if (!TargetsMatch) return false;
 
+    // If we are batching explicit offset I/O, we must prove they are strictly contiguous
+    if (NewArgs.Type == IOArgs::POSIX_PREAD || NewArgs.Type == IOArgs::POSIX_PWRITE) {
+      Value *LastOffset = LastCall->getArgOperand(3);
+      Value *NewOffset = NewCall->getArgOperand(3);
+      Value *LastLen = LastArgs.Length;
+
+      bool isContiguous = false;
+          
+      // Use SCEV specifically for integers, avoiding pointer-type extensions
+      if (SE.isSCEVable(LastOffset->getType()) && SE.isSCEVable(NewOffset->getType()) && SE.isSCEVable(LastLen->getType())) {
+	const SCEV *SLast = SE.getSCEV(LastOffset);
+	const SCEV *SNew = SE.getSCEV(NewOffset);
+	const SCEV *SLen = SE.getSCEV(LastLen);
+              
+	if (!isa<SCEVCouldNotCompute>(SLast) && !isa<SCEVCouldNotCompute>(SNew) && !isa<SCEVCouldNotCompute>(SLen)) {
+	  // Ensure they are all the same integer width before adding
+	  if (SLast->getType() == SLen->getType()) {
+	    const SCEV *ExpectedNext = SE.getAddExpr(SLast, SLen);
+	    if (ExpectedNext == SNew) isContiguous = true;
+	  }
+	}
+      }
+
+      // Fallback: If SCEV fails, see if they are raw Constants we can just add
+      if (!isContiguous) {
+	if (auto *CLastOff = dyn_cast<ConstantInt>(LastOffset)) {
+	  if (auto *CNewOff = dyn_cast<ConstantInt>(NewOffset)) {
+	    if (auto *CLen = dyn_cast<ConstantInt>(LastLen)) {
+	      if (CLastOff->getZExtValue() + CLen->getZExtValue() == CNewOff->getZExtValue()) {
+		isContiguous = true;
+	      }
+	    }
+	  }
+	}
+      }
+
+      if (!isContiguous) return false; // Not contiguous, abort batch
+    } else if (NewArgs.Type == IOArgs::POSIX_WRITE || NewArgs.Type == IOArgs::POSIX_READ) {
+      // Implicit offsets. As long as NewArgs.FD == LastArgs.FD, 
+      // the kernel guarantees disk contiguity. We only need to check memory hazards.
+      if (NewArgs.FD != LastArgs.FD) return false;
+    }  
+
     // Helper for precise sizes
     auto getPreciseLoc = [&](Value *Buf, Value *Len) {
       if (auto *C = dyn_cast<ConstantInt>(Len))
@@ -107,53 +176,55 @@ namespace {
 
     MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
 
-    // 2. The Hazard Scanning Loop
+    // Hazard Scanning Loop
     for (Instruction *I = LastCall->getNextNode(); I != NewCall; I = I->getNextNode()) {
       if (!I) return false;
 
-      // Opaque Barriers and Lifetimes
+      // Opaque barriers and lifetimes
       if (auto *CI = dyn_cast<CallInst>(I)) {
-          if (CI->getIntrinsicID() == Intrinsic::lifetime_end ||
-              CI->getIntrinsicID() == Intrinsic::lifetime_start) {
-              return false;
-          }
-          if (getIOArguments(CI).Type != IOArgs::NONE) return false;
+	if (CI->getIntrinsicID() == Intrinsic::lifetime_end ||
+	    CI->getIntrinsicID() == Intrinsic::lifetime_start) {
+	  return false;
+	}
+	if (getIOArguments(CI).Type != IOArgs::NONE) return false;
 
-          // If it's an opaque function that might write memory, ABORT!
-          if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
+	// If it's an opaque function that might write memory exit
+	if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
       }
 
       if (!I->mayReadOrWriteMemory()) continue;
 
-      // Hazard Check A: Is the new buffer mutated?
+      // Hazard check A: Is the new buffer mutated?
       if (isModSet(AA.getModRefInfo(I, NewLoc))) return false;
 
-      // Hazard Check B: Are any already batched buffers mutated?
+      // Hazard check B: Are any already batched buffers mutated?
       for (CallInst *BatchedCall : Batch) {
         IOArgs BArgs = getIOArguments(BatchedCall);
         MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
         if (isModSet(AA.getModRefInfo(I, BLoc))) return false;
       }
 
-      // Hazard Check C: Is the File Descriptor / FILE* mutated?
+      // Hazard check C: Is the File Descriptor / FILE* mutated?
       // Check if the Target itself is a pointer (e.g., FILE*)
       if (FirstArgs.Target->getType()->isPointerTy()) {
-          MemoryLocation TargetLoc(FirstArgs.Target, LocationSize::beforeOrAfterPointer());
-          if (isModSet(AA.getModRefInfo(I, TargetLoc))) return false;
+	MemoryLocation TargetLoc(FirstArgs.Target, LocationSize::beforeOrAfterPointer());
+	if (isModSet(AA.getModRefInfo(I, TargetLoc))) return false;
       }
-      
-      // CRITICAL FIX: If the target is an integer loaded from memory (e.g., int fd),
-      // we MUST ensure the memory holding that integer wasn't overwritten!
+
+
+      // Tell Alias Analysis the exact size of the FD integer (usually 4 bytes)
+      // to prevent "MayAlias" explosions in massive LTO functions
       if (Load1) {
-          MemoryLocation FdLoc(Load1->getPointerOperand(), LocationSize::beforeOrAfterPointer());
-          if (isModSet(AA.getModRefInfo(I, FdLoc))) return false;
-      }
+	uint64_t FdSize = DL.getTypeStoreSize(Load1->getType());
+	MemoryLocation FdLoc(Load1->getPointerOperand(), LocationSize::precise(FdSize));
+	if (isModSet(AA.getModRefInfo(I, FdLoc))) return false;
+      }      
     }
 
     return true;
-}
+  }
 
-// ====================================================================
+  // ====================================================================
   // 1. Define the I/O Patterns
   // ====================================================================
   enum class IOPattern {
@@ -165,25 +236,39 @@ namespace {
   };
 
   // ====================================================================
-  // Classifier: Analyes the batch and decides the best strategy
+  // Classifier: Analyse the batch and decides the best strategy
   // ====================================================================
-  IOPattern classifyBatch(const std::vector<CallInst*> &Batch, const DataLayout &DL, uint64_t &OutTotalConstSize) {
+  IOPattern classifyBatch(const std::vector<CallInst*> &Batch, const DataLayout &DL, uint64_t &OutTotalConstSize, ScalarEvolution &SE) {
     if (Batch.size() <= 1) return IOPattern::Unprofitable;
 
     IOArgs FirstArgs = getIOArguments(Batch.front());
-    bool isRead = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD);
+
+    bool isWrite = (FirstArgs.Type == IOArgs::POSIX_WRITE || 
+                    FirstArgs.Type == IOArgs::C_FWRITE || 
+                    FirstArgs.Type == IOArgs::CXX_WRITE || 
+                    FirstArgs.Type == IOArgs::POSIX_PWRITE);
+
+    bool isRead = (FirstArgs.Type == IOArgs::POSIX_READ || 
+                   FirstArgs.Type == IOArgs::C_FREAD || 
+                   FirstArgs.Type == IOArgs::POSIX_PREAD);
+
+    if (!isWrite && !isRead) return IOPattern::Unprofitable;
 
     // Pattern A: Is it perfectly contiguous?
     bool AllContiguous = true;
     for (size_t i = 0; i < Batch.size() - 1; ++i) {
       IOArgs A = getIOArguments(Batch[i]);
       IOArgs B = getIOArguments(Batch[i+1]);
-      if (!checkAdjacency(A.Buffer, A.Length, B.Buffer, DL)) {
+      if (!checkAdjacency(A.Buffer, A.Length, B.Buffer, DL, &SE)) {
         AllContiguous = false;
         break;
       }
     }
     if (AllContiguous) return IOPattern::Contiguous;
+
+    if (FirstArgs.Type == IOArgs::POSIX_PWRITE || FirstArgs.Type == IOArgs::POSIX_PREAD) {
+      return (Batch.size() >= (isWrite ? 4 : 2)) ? IOPattern::Vectored : IOPattern::Unprofitable;
+    }
 
     // If it's not contiguous, we can't batch basic reads/writes without vectoring support
     if (FirstArgs.Type != IOArgs::POSIX_WRITE && FirstArgs.Type != IOArgs::POSIX_READ) {
@@ -195,28 +280,28 @@ namespace {
     uint64_t UniformSize = 0;
     
     if (!isRead && Batch.size() > 1) {
-        if (auto *FirstSizeC = dyn_cast<ConstantInt>(getIOArguments(Batch.front()).Length)) {
-            UniformSize = FirstSizeC->getZExtValue();
-            // Only attempt SIMD gather for standard primitive sizes (e.g., 32-bit or 64-bit fields)
-            if (UniformSize == 1 || UniformSize == 2 || UniformSize == 4 || UniformSize == 8) {
-                isStrided = true;
-                for (CallInst *C : Batch) {
-                    auto *SizeC = dyn_cast<ConstantInt>(getIOArguments(C).Length);
-                    if (!SizeC || SizeC->getZExtValue() != UniformSize) {
-                        isStrided = false;
-                        break;
-                    }
-                }
-            }
-        }
+      if (auto *FirstSizeC = dyn_cast<ConstantInt>(getIOArguments(Batch.front()).Length)) {
+	UniformSize = FirstSizeC->getZExtValue();
+	// Only attempt SIMD gather for standard primitive sizes (e.g., 32-bit or 64-bit fields)
+	if (UniformSize == 1 || UniformSize == 2 || UniformSize == 4 || UniformSize == 8) {
+	  isStrided = true;
+	  for (CallInst *C : Batch) {
+	    auto *SizeC = dyn_cast<ConstantInt>(getIOArguments(C).Length);
+	    if (!SizeC || SizeC->getZExtValue() != UniformSize) {
+	      isStrided = false;
+	      break;
+	    }
+	  }
+	}
+      }
     }
 
     if (isStrided) {
-        OutTotalConstSize = UniformSize; // Pass the uniform element size to the router
-        // Profitability Check: Gathering into a vector is highly profitable if we have >= 4 elements
-        if (Batch.size() >= 4 && Batch.size() <= 64) {
-            return IOPattern::Strided;
-        }
+      OutTotalConstSize = UniformSize; // Pass the uniform element size to the router
+      // Profitability Check: Gathering into a vector is highly profitable if we have >= 4 elements
+      if (Batch.size() >= 4 && Batch.size() <= 64) {
+	return IOPattern::Strided;
+      }
     }
 
     // Evaluate dynamic sizes and byte-weight
@@ -244,12 +329,12 @@ namespace {
       if (AllSizesConstant && TotalConstSize > 128) DynamicThreshold = 3;
     }
 
-    // Pattern C: Vectored I/O (Meets the strict profitable threshold)
+    // Pattern C: Vectored I/O (meets the strict profitable threshold)
     if (Batch.size() >= DynamicThreshold) {
       return IOPattern::Vectored;
     }
 
-    // Pattern D: Shadow Buffer (Fails vectored threshold, but small enough to pack manually)
+    // Pattern D: Shadow buffer (fails vectored threshold, but small enough to pack manually)
     if (!isRead && AllSizesConstant && TotalConstSize > 0 && TotalConstSize <= IOShadowBufferSize) {
       return IOPattern::ShadowBuffer;
     }
@@ -259,16 +344,15 @@ namespace {
   }
 
   // ====================================================================
-  // 3. The Router: Executes the IR transformations based on the Classifier
+  // The Router: Executes the IR transformations based on the Classifier
   // ====================================================================
-  bool flushBatch(std::vector<CallInst*> &Batch, Module *M) {
+  bool flushBatch(std::vector<CallInst*> &Batch, Module *M, ScalarEvolution &SE) {
     if (Batch.empty()) return false;
 
     const DataLayout &DL = M->getDataLayout();
     uint64_t TotalConstSize = 0;
     
-    // Ask the Classifier what to do!
-    IOPattern Pattern = classifyBatch(Batch, DL, TotalConstSize);
+    IOPattern Pattern = classifyBatch(Batch, M->getDataLayout(), TotalConstSize, SE);
 
     if (Pattern == IOPattern::Unprofitable) {
       Batch.clear();
@@ -277,135 +361,165 @@ namespace {
 
     IRBuilder<> Builder(Batch.back());
     IOArgs FirstArgs = getIOArguments(Batch.front());
-    bool isRead = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD);
+    bool isRead = (FirstArgs.Type == IOArgs::POSIX_READ || 
+                   FirstArgs.Type == IOArgs::C_FREAD || 
+                   FirstArgs.Type == IOArgs::POSIX_PREAD);
+ 
+    bool hasOffset = (FirstArgs.Type == IOArgs::POSIX_PREAD || 
+                      FirstArgs.Type == IOArgs::POSIX_PWRITE);
 
     // Route to the highly specialized emission logic
     switch (Pattern) {
-      case IOPattern::Contiguous: {
-        Value *TotalLen = FirstArgs.Length;
-        for (size_t i = 1; i < Batch.size(); ++i) {
-          TotalLen = Builder.CreateAdd(TotalLen, getIOArguments(Batch[i]).Length, "sum.len");
-        }
+    case IOPattern::Contiguous: {
+      Value *TotalLen = FirstArgs.Length;
+      for (size_t i = 1; i < Batch.size(); ++i) {
+	TotalLen = Builder.CreateAdd(TotalLen, getIOArguments(Batch[i]).Length, "sum.len");
+      }
           
-        std::vector<Value *> NewArgs;
-        if (FirstArgs.Type == IOArgs::C_FWRITE || FirstArgs.Type == IOArgs::C_FREAD) {
-          NewArgs = {FirstArgs.Buffer, Batch[0]->getArgOperand(1), TotalLen, FirstArgs.Target};
-        } else {
-          NewArgs = {FirstArgs.Target, FirstArgs.Buffer, TotalLen};
-        }
-        Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
-        errs() << "[IOOpt] SUCCESS: N-Way merged " << Batch.size() << " contiguous " << (isRead ? "reads" : "writes") << "!\n";
-        break;
+      std::vector<Value *> NewArgs;
+      if (FirstArgs.Type == IOArgs::C_FWRITE || FirstArgs.Type == IOArgs::C_FREAD) {
+	NewArgs = {FirstArgs.Buffer, Batch[0]->getArgOperand(1), TotalLen, FirstArgs.Target};
+      } else {
+	NewArgs = {FirstArgs.Target, FirstArgs.Buffer, TotalLen};
+      }
+      Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
+      errs() << "[IOOpt] SUCCESS: N-Way merged " << Batch.size() << " contiguous " << (isRead ? "reads" : "writes") << "!\n";
+      break;
+    }
+
+    case IOPattern::Strided: {
+      // TotalConstSize here holds the size of one element (e.g., 4 bytes)
+      unsigned ElementBytes = TotalConstSize;
+      unsigned NumElements = Batch.size();
+        
+      // Define the LLVM Types for the SIMD Vector
+      Type *ElementTy = Builder.getIntNTy(ElementBytes * 8); // e.g., i32
+      auto *VecTy = FixedVectorType::get(ElementTy, NumElements);
+        
+      // Start with an empty (poison) vector register
+      Value *GatherVec = PoisonValue::get(VecTy);
+        
+      // Gather the scattered data into the CPU vector register
+      for (unsigned i = 0; i < NumElements; ++i) {
+	IOArgs Args = getIOArguments(Batch[i]);
+	Value *DataPtr = Args.Buffer;
+	// Load the single struct field
+	LoadInst *LoadedVal = Builder.CreateLoad(ElementTy, DataPtr, "strided.load");
+	// Insert it into the vector register
+	GatherVec = Builder.CreateInsertElement(GatherVec, LoadedVal, Builder.getInt32(i), "gather.insert");
+      }
+        
+      // Allocate a perfectly sized contiguous buffer on the stack
+      Function *F = Batch.back()->getFunction();
+      IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+      AllocaInst *ContiguousBuf = EntryBuilder.CreateAlloca(VecTy, nullptr, "simd.shadow.buf");
+        
+      // Store the entire vector register to the stack in one instruction
+      Builder.CreateStore(GatherVec, ContiguousBuf);
+        
+      // Issue a single write() system call for the entire batch
+      Value *TotalLenVal = Builder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), ElementBytes * NumElements);
+      Value *BufCast = Builder.CreatePointerCast(ContiguousBuf, Builder.getPtrTy());
+        
+      std::vector<Value *> NewArgs;
+      if (FirstArgs.Type == IOArgs::C_FWRITE) {
+	NewArgs = {BufCast, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
+      } else {
+	NewArgs = {FirstArgs.Target, BufCast, TotalLenVal};
+      }
+      Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
+        
+      errs() << "[IOOpt] SUCCESS: SIMD Gathered " << NumElements << " strided writes into 1!\n";
+      break;
+    }
+
+    case IOPattern::ShadowBuffer: {
+      Function *F = Batch.back()->getFunction();
+      IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+        
+      Type *Int8Ty = Builder.getInt8Ty();
+      ArrayType *ShadowArrTy = ArrayType::get(Int8Ty, TotalConstSize);
+      AllocaInst *ShadowBuf = EntryBuilder.CreateAlloca(ShadowArrTy, nullptr, "shadow.buf");
+        
+      uint64_t Offset = 0;
+      for (size_t i = 0; i < Batch.size(); ++i) {
+	IOArgs Args = getIOArguments(Batch[i]);
+	uint64_t Len = cast<ConstantInt>(Args.Length)->getZExtValue();
+	Value *DestPtr = Builder.CreateInBoundsGEP(ShadowArrTy, ShadowBuf, {Builder.getInt32(0), Builder.getInt32(Offset)});
+	Builder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
+	Offset += Len;
+      }
+        
+      Value *TotalLenVal = Builder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), TotalConstSize);
+      std::vector<Value *> NewArgs;
+      if (FirstArgs.Type == IOArgs::C_FWRITE) {
+	NewArgs = {ShadowBuf, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
+      } else {
+	NewArgs = {FirstArgs.Target, ShadowBuf, TotalLenVal};
+      }
+      Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
+      errs() << "[IOOpt] SUCCESS: Shadow Buffered " << Batch.size() << " writes into 1 (" << TotalConstSize << " bytes)!\n";
+      break;
+    }
+
+    case IOPattern::Vectored: {
+      Type *Int32Ty = Builder.getInt32Ty();
+      Type *PtrTy = Builder.getPtrTy();
+      Type *SizeTy = DL.getIntPtrType(M->getContext());
+
+      // Determine the correct function name
+      StringRef FuncName;
+      if (hasOffset) {
+	FuncName = isRead ? "preadv" : "pwritev";
+      } else {
+	FuncName = isRead ? "readv" : "writev";
       }
 
-      case IOPattern::Strided: {
-        // TotalConstSize here holds the size of ONE element (e.g., 4 bytes)
-        unsigned ElementBytes = TotalConstSize;
-        unsigned NumElements = Batch.size();
-        
-        // Define the LLVM Types for the SIMD Vector
-        Type *ElementTy = Builder.getIntNTy(ElementBytes * 8); // e.g., i32
-        auto *VecTy = FixedVectorType::get(ElementTy, NumElements);
-        
-        // Start with an empty (poison) vector register
-        Value *GatherVec = PoisonValue::get(VecTy);
-        
-        // Gather the scattered data into the CPU vector register!
-        for (unsigned i = 0; i < NumElements; ++i) {
-            IOArgs Args = getIOArguments(Batch[i]);
-            Value *DataPtr = Args.Buffer;
-            // Load the single struct field
-            LoadInst *LoadedVal = Builder.CreateLoad(ElementTy, DataPtr, "strided.load");
-            // Insert it into the vector register
-            GatherVec = Builder.CreateInsertElement(GatherVec, LoadedVal, Builder.getInt32(i), "gather.insert");
-        }
-        
-        // Allocate a perfectly sized contiguous buffer on the stack
-        Function *F = Batch.back()->getFunction();
-        IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
-        AllocaInst *ContiguousBuf = EntryBuilder.CreateAlloca(VecTy, nullptr, "simd.shadow.buf");
-        
-        // Store the entire vector register to the stack in one instruction
-        Builder.CreateStore(GatherVec, ContiguousBuf);
-        
-        // Issue a single write() system call for the entire batch
-        Value *TotalLenVal = Builder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), ElementBytes * NumElements);
-        Value *BufCast = Builder.CreatePointerCast(ContiguousBuf, Builder.getPtrTy());
-        
-        std::vector<Value *> NewArgs;
-        if (FirstArgs.Type == IOArgs::C_FWRITE) {
-            NewArgs = {BufCast, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
-        } else {
-            NewArgs = {FirstArgs.Target, BufCast, TotalLenVal};
-        }
-        Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
-        
-        errs() << "[IOOpt] SUCCESS: SIMD Gathered " << NumElements << " strided writes into 1!\n";
-        break;
+      // Build the correct Function Signature
+      FunctionType *FnTy;
+      if (hasOffset) {
+	Type *OffType = FirstArgs.Offset->getType();
+	// Signature: (int fd, const struct iovec *iov, int iovcnt, off_t offset)
+	FnTy = FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty, OffType}, false);
+      } else {
+	// Signature: (int fd, const struct iovec *iov, int iovcnt)
+	FnTy = FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty}, false);
+      }
+      FunctionCallee VecFunc = M->getOrInsertFunction(FuncName, FnTy);
+
+      // Build the iovec array on the stack
+      StructType *IovecTy = StructType::get(M->getContext(), {PtrTy, SizeTy});
+      ArrayType *IovArrayTy = ArrayType::get(IovecTy, Batch.size());
+
+      Function *F = Batch.back()->getFunction();
+      IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+      AllocaInst *IovArray = EntryBuilder.CreateAlloca(IovArrayTy, nullptr, "iovec.array.N");
+
+      for (size_t i = 0; i < Batch.size(); ++i) {
+	IOArgs Args = getIOArguments(Batch[i]);
+	Value *IovPtr = Builder.CreateInBoundsGEP(IovArrayTy, IovArray, {Builder.getInt32(0), Builder.getInt32(i)});
+	Builder.CreateStore(Args.Buffer, Builder.CreateStructGEP(IovecTy, IovPtr, 0));
+	Builder.CreateStore(Builder.CreateIntCast(Args.Length, SizeTy, false), Builder.CreateStructGEP(IovecTy, IovPtr, 1));
       }
 
-      case IOPattern::ShadowBuffer: {
-        Function *F = Batch.back()->getFunction();
-        IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+      // Emit the actual system call
+      Value *Fd = Builder.CreateIntCast(FirstArgs.Target, Int32Ty, false);
+      Value *IovCnt = Builder.getInt32(Batch.size());
         
-        Type *Int8Ty = Builder.getInt8Ty();
-        ArrayType *ShadowArrTy = ArrayType::get(Int8Ty, TotalConstSize);
-        AllocaInst *ShadowBuf = EntryBuilder.CreateAlloca(ShadowArrTy, nullptr, "shadow.buf");
-        
-        uint64_t Offset = 0;
-        for (size_t i = 0; i < Batch.size(); ++i) {
-          IOArgs Args = getIOArguments(Batch[i]);
-          uint64_t Len = cast<ConstantInt>(Args.Length)->getZExtValue();
-          Value *DestPtr = Builder.CreateInBoundsGEP(ShadowArrTy, ShadowBuf, {Builder.getInt32(0), Builder.getInt32(Offset)});
-          Builder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
-          Offset += Len;
-        }
-        
-        Value *TotalLenVal = Builder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), TotalConstSize);
-        std::vector<Value *> NewArgs;
-        if (FirstArgs.Type == IOArgs::C_FWRITE) {
-          NewArgs = {ShadowBuf, Batch[0]->getArgOperand(1), TotalLenVal, FirstArgs.Target};
-        } else {
-          NewArgs = {FirstArgs.Target, ShadowBuf, TotalLenVal};
-        }
-        Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
-        errs() << "[IOOpt] SUCCESS: Shadow Buffered " << Batch.size() << " writes into 1 (" << TotalConstSize << " bytes)!\n";
-        break;
+      if (hasOffset) {
+	Builder.CreateCall(VecFunc, {Fd, IovArray, IovCnt, FirstArgs.Offset});
+      } else {
+	Builder.CreateCall(VecFunc, {Fd, IovArray, IovCnt});
       }
+        
+      errs() << "[IOOpt] SUCCESS: N-Way converted " << Batch.size() << " "
+	     << (isRead ? "reads" : "writes") << " to " << FuncName << "!\n";
+      break;
+    }
 
-      case IOPattern::Vectored: {
-        Type *Int32Ty = Builder.getInt32Ty();
-        Type *PtrTy = PointerType::getUnqual(M->getContext());
-        Type *SizeTy = DL.getIntPtrType(M->getContext());
-        
-        StringRef FuncName = isRead ? "readv" : "writev";
-        FunctionType *VecTy = FunctionType::get(SizeTy, {Int32Ty, PtrTy, Int32Ty}, false);
-        FunctionCallee VecFunc = M->getOrInsertFunction(FuncName, VecTy);
-        
-        StructType *IovecTy = StructType::get(M->getContext(), {PtrTy, SizeTy});
-        ArrayType *IovArrayTy = ArrayType::get(IovecTy, Batch.size());
-        
-        Function *F = Batch.back()->getFunction();
-        IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
-        AllocaInst *IovArray = EntryBuilder.CreateAlloca(IovArrayTy, nullptr, "iovec.array.N");
-        
-        for (size_t i = 0; i < Batch.size(); ++i) {
-          IOArgs Args = getIOArguments(Batch[i]);
-          Value *IovPtr = Builder.CreateInBoundsGEP(IovArrayTy, IovArray, {Builder.getInt32(0), Builder.getInt32(i)});
-          Builder.CreateStore(Args.Buffer, Builder.CreateStructGEP(IovecTy, IovPtr, 0));
-          Builder.CreateStore(Builder.CreateIntCast(Args.Length, SizeTy, false), Builder.CreateStructGEP(IovecTy, IovPtr, 1));
-        }
-        
-        Value *Fd = Builder.CreateIntCast(FirstArgs.Target, Int32Ty, false);
-        Builder.CreateCall(VecFunc, {Fd, IovArray, Builder.getInt32(Batch.size())});
-        errs() << "[IOOpt] SUCCESS: N-Way converted " << Batch.size() << " " 
-               << (isRead ? "reads" : "writes") << " to " << FuncName << "!\n";
-        break;
-      }
-
-      case IOPattern::Unprofitable:
-      default:
-        break;
+    case IOPattern::Unprofitable:
+    default:
+      break;
     }
         
     // Clean up the old unoptimised instructions
@@ -451,101 +565,94 @@ namespace {
     return false;
   }
 
-  // ====================================================================
-    // PHASE 1: LOOP-EXIT (LAZY) FLUSHING (Hardened for LCSSA)
-    // ====================================================================
-    bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
-      // 1. We need the Exit block (to drop the new I/O) and the Preheader (to setup pointers)
-      BasicBlock *ExitBB = L->getExitBlock();
-      BasicBlock *Preheader = L->getLoopPreheader();
-      if (!ExitBB || !Preheader) return false;
+  bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
+    // We need the Exit block (to drop the new I/O) and the Preheader (to setup pointers)
+    BasicBlock *ExitBB = L->getExitBlock();
+    BasicBlock *Preheader = L->getLoopPreheader();
+    if (!ExitBB || !Preheader) return false;
 
-      // 2. Ask SCEV exactly how many times this loop will run.
-      unsigned TripCount = SE.getSmallConstantTripCount(L);
-      if (TripCount == 0) return false;
+    // Ask SCEV exactly how many times this loop will run.
+    unsigned TripCount = SE.getSmallConstantTripCount(L);
+    if (TripCount == 0) return false;
 
-      bool LoopChanged = false;
+    bool LoopChanged = false;
 
-      for (BasicBlock *BB : L->blocks()) {
-        for (Instruction &I : llvm::make_early_inc_range(*BB)) {
-          if (auto *Call = dyn_cast<CallInst>(&I)) {
-            IOArgs Args = getIOArguments(Call);
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : llvm::make_early_inc_range(*BB)) {
+	if (auto *Call = dyn_cast<CallInst>(&I)) {
+	  IOArgs Args = getIOArguments(Call);
             
-            if (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_READ || 
-                Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
+	  if (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_READ || 
+	      Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
                 
-              auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
-              if (!ConstLen) continue;
+	    auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
+	    if (!ConstLen) continue;
 
-              uint64_t ElementSize = ConstLen->getZExtValue();
-              uint64_t TotalBytes = ElementSize * TripCount;
+	    uint64_t ElementSize = ConstLen->getZExtValue();
+	    uint64_t TotalBytes = ElementSize * TripCount;
 
-              if (TotalBytes > IOHighWaterMark) continue;
-
-              // ==========================================================
-              // CRASH FIX: LCSSA & Dominator Protection
-              // ==========================================================
+	    if (TotalBytes > IOHighWaterMark) continue;
               
-              // Rule 1: The File Descriptor / Stream MUST not change during the loop
-              if (!L->isLoopInvariant(Args.Target)) continue;
+	    // Rule 1: The File Descriptor / Stream must not change during the loop
+	    if (!L->isLoopInvariant(Args.Target)) continue;
 
-              // Rule 2: Extra arguments (like `size` in C_FWRITE) MUST not change
-              Value *ExtraArg = nullptr;
-              if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
-                  ExtraArg = Call->getArgOperand(1);
-                  if (!L->isLoopInvariant(ExtraArg)) continue; 
-              }
+	    // Rule 2: Extra arguments (like `size` in C_FWRITE) must not change
+	    Value *ExtraArg = nullptr;
+	    if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
+	      ExtraArg = Call->getArgOperand(1);
+	      if (!L->isLoopInvariant(ExtraArg)) continue; 
+	    }
 
-              // Rule 3: Safely Trace the Memory Pointer using SCEV!
-              const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
-              Value *BasePointer = nullptr;
+	    // Rule 3: Safely Trace the Memory Pointer using SCEV
+	    const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
+	    Value *BasePointer = nullptr;
 
-              if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
-                  // It's a sequential array traversal! (e.g., ptr++ each loop)
-                  if (AddRec->getLoop() == L) {
-                      // Verify the pointer strides forward by exactly the ElementSize
-                      if (auto *StepConst = dyn_cast<SCEVConstant>(AddRec->getStepRecurrence(SE))) {
-                          if (StepConst->getValue()->getZExtValue() == ElementSize) {
-                              // Expand the starting pointer safely into the Preheader!
-                              SCEVExpander Expander(SE, DL, "io.base.expander");
-                              BasePointer = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), Preheader->getTerminator());
-                          }
-                      }
-                  }
-              } else if (SE.isLoopInvariant(PtrSCEV, L)) {
-                  // The pointer never moves during the loop
-                  BasePointer = Args.Buffer; 
-              }
+	    if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
+	      // It's a sequential array traversal (e.g., ptr++ each loop)
+	      if (AddRec->getLoop() == L) {
+		// Verify the pointer strides forward by exactly the ElementSize
+		if (auto *StepConst = dyn_cast<SCEVConstant>(AddRec->getStepRecurrence(SE))) {
+		  if (StepConst->getValue()->getZExtValue() == ElementSize) {
+		    // Expand the starting pointer safely into the Preheader
+		    SCEVExpander Expander(SE, DL, "io.base.expander");
+		    BasePointer = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), Preheader->getTerminator());
+		  }
+		}
+	      }
+	    } else if (SE.isLoopInvariant(PtrSCEV, L)) {
+	      // The pointer never moves during the loop
+	      BasePointer = Args.Buffer; 
+	    }
 
-              // If we couldn't prove the pointer math is perfectly sequential and safe, ABORT!
-              if (!BasePointer) continue;
+	    // If we couldn't prove the pointer math is perfectly sequential and safe so exit
+	    if (!BasePointer) continue;
 
-              // ==========================================================
-              // THE TRANSFORMATION
-              // ==========================================================
-              IRBuilder<> ExitBuilder(&*ExitBB->getFirstInsertionPt());
-              Value *TotalLenVal = ExitBuilder.getIntN(Args.Length->getType()->getIntegerBitWidth(), TotalBytes);
+	    // ==========================================================
+	    // THE TRANSFORMATION
+	    // ==========================================================
+	    IRBuilder<> ExitBuilder(&*ExitBB->getFirstInsertionPt());
+	    Value *TotalLenVal = ExitBuilder.getIntN(Args.Length->getType()->getIntegerBitWidth(), TotalBytes);
               
-              std::vector<Value *> NewArgs;
-              if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
-                NewArgs = {BasePointer, ExtraArg, TotalLenVal, Args.Target};
-              } else {
-                NewArgs = {Args.Target, BasePointer, TotalLenVal};
-              }
+	    std::vector<Value *> NewArgs;
+	    if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
+	      NewArgs = {BasePointer, ExtraArg, TotalLenVal, Args.Target};
+	    } else {
+	      NewArgs = {Args.Target, BasePointer, TotalLenVal};
+	    }
 
-              ExitBuilder.CreateCall(Call->getCalledFunction(), NewArgs);
+	    ExitBuilder.CreateCall(Call->getCalledFunction(), NewArgs);
 
-              errs() << "[IOOpt] SUCCESS: Hoisted Loop I/O! Scaled " << ElementSize 
-                     << " bytes * " << TripCount << " iterations = " << TotalBytes << " bytes at loop exit.\n";
+	    errs() << "[IOOpt] SUCCESS: Hoisted Loop I/O! Scaled " << ElementSize 
+		   << " bytes * " << TripCount << " iterations = " << TotalBytes << " bytes at loop exit.\n";
 
-              Call->eraseFromParent();
-              LoopChanged = true;
-            }
-          }
-        }
+	    Call->eraseFromParent();
+	    LoopChanged = true;
+	  }
+	}
       }
-      return LoopChanged;
     }
+    return LoopChanged;
+  }
 
   bool sinkWrite(CallInst *WriteCall, AAResults &AA, const DataLayout &DL) {
 
@@ -566,7 +673,7 @@ namespace {
       if (auto *CI = dyn_cast<CallInst>(CurrentInst)) {
         if (CI->getIntrinsicID() == Intrinsic::lifetime_end || 
             CI->getIntrinsicID() == Intrinsic::lifetime_start) {
-            break;
+	  break;
         }
         if (getIOArguments(CI).Type != IOArgs::NONE) break;
       }
@@ -592,11 +699,8 @@ namespace {
   struct IOOptimisationPass : public PassInfoMixin<IOOptimisationPass> {
     IOOptimisationPass() {}
 
-    // ====================================================================
-    // PHASE 1: LOOP-EXIT (LAZY) FLUSHING (Hardened for LCSSA)
-    // ====================================================================
     bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
-      // 1. We need the Exit block (to drop the new I/O) and the Preheader (to safely setup pointers)
+      // We need the Exit block (to drop the new I/O) and the Preheader (to safely setup pointers)
       BasicBlock *ExitBB = L->getExitBlock();
       BasicBlock *Preheader = L->getLoopPreheader();
       if (!ExitBB || !Preheader) return false;
@@ -611,7 +715,6 @@ namespace {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
             IOArgs Args = getIOArguments(Call);
             
-            // ARCHITECTURE FIX: Only hoist unbuffered POSIX syscalls!
             // C_FWRITE (fwrite) is already buffered by libc. Hoisting it 
             // breaks internal stream state and causes LCSSA dominance errors.
             if (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_READ) {
@@ -627,32 +730,29 @@ namespace {
               // Rule 1: The File Descriptor MUST be safely outside the loop
               if (!L->isLoopInvariant(Args.Target)) continue;
 
-              // Rule 2: Safely Trace and Materialize the Memory Pointer!
+              // Rule 2: Safely Trace and Materialize the Memory Pointer
               const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
               Value *BasePointer = nullptr;
 
               if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
-                  if (AddRec->getLoop() == L) {
-                      if (auto *StepConst = dyn_cast<SCEVConstant>(AddRec->getStepRecurrence(SE))) {
-                          if (StepConst->getValue()->getZExtValue() == ElementSize) {
-                              // Expand the starting pointer safely into the Preheader!
-                              SCEVExpander Expander(SE, DL, "io.base.expander");
-                              BasePointer = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), Preheader->getTerminator());
-                          }
-                      }
-                  }
+		if (AddRec->getLoop() == L) {
+		  if (auto *StepConst = dyn_cast<SCEVConstant>(AddRec->getStepRecurrence(SE))) {
+		    if (StepConst->getValue()->getZExtValue() == ElementSize) {
+		      // Expand the starting pointer safely into the Preheader
+		      SCEVExpander Expander(SE, DL, "io.base.expander");
+		      BasePointer = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), Preheader->getTerminator());
+		    }
+		  }
+		}
               } else if (SE.isLoopInvariant(PtrSCEV, L)) {
-                  // CRITICAL FIX: Even if the math is invariant, force materialization 
-                  // in the Preheader to guarantee it physically dominates the ExitBB!
-                  SCEVExpander Expander(SE, DL, "io.base.expander");
-                  BasePointer = Expander.expandCodeFor(PtrSCEV, Args.Buffer->getType(), Preheader->getTerminator());
+		// Even if the math is invariant, force materialization 
+		// in the Preheader to guarantee it physically dominates the ExitBB!
+		SCEVExpander Expander(SE, DL, "io.base.expander");
+		BasePointer = Expander.expandCodeFor(PtrSCEV, Args.Buffer->getType(), Preheader->getTerminator());
               }
 
               if (!BasePointer) continue;
 
-              // ==========================================================
-              // THE TRANSFORMATION
-              // ==========================================================
               IRBuilder<> ExitBuilder(&*ExitBB->getFirstInsertionPt());
               Value *TotalLenVal = ExitBuilder.getIntN(Args.Length->getType()->getIntegerBitWidth(), TotalBytes);
               
@@ -671,9 +771,6 @@ namespace {
       return LoopChanged;
     }
 
-    // ====================================================================
-    // MAIN PASS EXECUTION
-    // ====================================================================
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
       errs() << "[IOOpt] Analysing function: " << F.getName() << "\n";
       bool Changed = false;
@@ -694,7 +791,7 @@ namespace {
         for (Instruction &I : llvm::make_early_inc_range(BB)) {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
             IOArgs CArgs = getIOArguments(Call);
-            if (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD) {
+            if (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD || CArgs.Type == IOArgs::POSIX_PREAD) {
               if (hoistRead(Call, AA, DL)) Changed = true;
             }
           }
@@ -706,7 +803,7 @@ namespace {
         for (Instruction &I : llvm::make_early_inc_range(llvm::reverse(BB))) {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
             IOArgs CArgs = getIOArguments(Call);
-            if (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::CXX_WRITE) {
+            if (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::CXX_WRITE || CArgs.Type == IOArgs::POSIX_PWRITE) {
               if (sinkWrite(Call, AA, DL)) Changed = true;
             }
           }
@@ -720,19 +817,39 @@ namespace {
 
         for (Instruction &I : llvm::make_early_inc_range(BB)) {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
+            
+            if (Function *F = Call->getCalledFunction()) {
+	      StringRef FuncName = F->getName();
+	      if (FuncName == "fsync" || FuncName == "fdatasync" || FuncName == "sync_file_range" || 
+		  FuncName == "posix_fadvise" || FuncName == "posix_fadvise64") {
+		// A storage barrier was hit. Do not reorder I/O across sync or OS cache boundaries.
+		if (flushBatch(IOBatch, BB.getParent()->getParent(), SE)) Changed = true;
+		CurrentBatchBytes = 0;
+		continue; 
+	      }
+            }
+
+            // Now proceed with normal I/O parsing...
             IOArgs CArgs = getIOArguments(Call);
-            bool isWrite = (CArgs.Type == IOArgs::POSIX_WRITE || CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::CXX_WRITE);
-            bool isRead = (CArgs.Type == IOArgs::POSIX_READ || CArgs.Type == IOArgs::C_FREAD);
+            
+            bool isWrite = (CArgs.Type == IOArgs::POSIX_WRITE ||
+                            CArgs.Type == IOArgs::C_FWRITE ||
+                            CArgs.Type == IOArgs::CXX_WRITE ||
+                            CArgs.Type == IOArgs::POSIX_PWRITE);
+
+            bool isRead = (CArgs.Type == IOArgs::POSIX_READ ||
+                           CArgs.Type == IOArgs::C_FREAD ||
+                           CArgs.Type == IOArgs::POSIX_PREAD);
 
             if (isWrite || isRead) {
               uint64_t CallBytes = 4096; // Safe default for dynamic sizes
               if (auto *ConstLen = dyn_cast<ConstantInt>(CArgs.Length)) {
-                  CallBytes = ConstLen->getZExtValue();
+		CallBytes = ConstLen->getZExtValue();
               }
 
               // Edge Case 1: Return value is used
               if (!Call->use_empty()) {
-                if (flushBatch(IOBatch, F.getParent())) Changed = true;
+                if (flushBatch(IOBatch, F.getParent(), SE)) Changed = true;
                 CurrentBatchBytes = 0;
                 continue;
               }
@@ -740,33 +857,33 @@ namespace {
               // Edge Case 2: Switching between Reads and Writes
               if (!IOBatch.empty()) {
                 IOArgs BatchArgs = getIOArguments(IOBatch.front());
-                bool BatchIsRead = (BatchArgs.Type == IOArgs::POSIX_READ || BatchArgs.Type == IOArgs::C_FREAD);
+                bool BatchIsRead = (BatchArgs.Type == IOArgs::POSIX_READ || BatchArgs.Type == IOArgs::C_FREAD || BatchArgs.Type == IOArgs::POSIX_PREAD);
                 if (BatchIsRead != isRead) {
-                   if (flushBatch(IOBatch, F.getParent())) Changed = true;
-                   CurrentBatchBytes = 0;
+		  if (flushBatch(IOBatch, F.getParent(), SE)) Changed = true;
+		  CurrentBatchBytes = 0;
                 }
               }
 
               // Main Logic: Is it safe to batch?
-              if (isSafeToAddToBatch(IOBatch, Call, AA, DL)) {
+              if (isSafeToAddToBatch(IOBatch, Call, AA, DL, SE)) {
                 IOBatch.push_back(Call);
                 CurrentBatchBytes += CallBytes;
 
-                // High-Water Mark Flush!
+                // High-Water mark flush
                 if (CurrentBatchBytes >= IOHighWaterMark) {
-                  if (flushBatch(IOBatch, F.getParent())) Changed = true;
+                  if (flushBatch(IOBatch, F.getParent(), SE)) Changed = true;
                   CurrentBatchBytes = 0;
                 }
               } else {
                 // Hazard detected.
-                if (flushBatch(IOBatch, F.getParent())) Changed = true;
+                if (flushBatch(IOBatch, F.getParent(), SE)) Changed = true;
                 IOBatch.push_back(Call);
-                CurrentBatchBytes = CallBytes; 
+                CurrentBatchBytes = CallBytes;
               }
             }
           }
         }
-        if (flushBatch(IOBatch, F.getParent())) Changed = true;
+        if (flushBatch(IOBatch, F.getParent(), SE)) Changed = true;
       }
 
       return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
@@ -775,38 +892,38 @@ namespace {
 }
 
 struct IOWrapperInlinePass : public PassInfoMixin<IOWrapperInlinePass> {
-    PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
-        bool Changed = false;
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
+    bool Changed = false;
         
-        for (Function &F : M) {
-            if (F.isDeclaration()) continue;
+    for (Function &F : M) {
+      if (F.isDeclaration()) continue;
 
-            unsigned InstCount = 0;
-            bool HasIO = false;
+      unsigned InstCount = 0;
+      bool HasIO = false;
 
-            for (BasicBlock &BB : F) {
-                for (Instruction &I : BB) {
-                    InstCount++;
-                    if (auto *Call = dyn_cast<CallInst>(&I)) {
-                        if (Function *Callee = Call->getCalledFunction()) {
-                            StringRef Name = Callee->getName();
-                            if (Name == "write" || Name == "writev" || Name == "fwrite") {
-                                HasIO = true;
-                            }
-                        }
-                    }
-                }
-            }
+      for (BasicBlock &BB : F) {
+	for (Instruction &I : BB) {
+	  InstCount++;
+	  if (auto *Call = dyn_cast<CallInst>(&I)) {
+	    if (Function *Callee = Call->getCalledFunction()) {
+	      StringRef Name = Callee->getName();
+	      if (Name == "write" || Name == "writev" || Name == "fwrite") {
+		HasIO = true;
+	      }
+	    }
+	  }
+	}
+      }
 
-            if (HasIO && InstCount < 10 && !F.hasFnAttribute(Attribute::NoInline)) {
-                errs() << "[IOOpt-Injector] Tagging '" << F.getName() << "' for aggressive LTO inlining...\n";
-                F.addFnAttr(Attribute::AlwaysInline);
-                Changed = true;
-            }
-        }
-        
-        return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+      if (HasIO && InstCount < 10 && !F.hasFnAttribute(Attribute::NoInline)) {
+	errs() << "[IOOpt-Injector] Tagging '" << F.getName() << "' for aggressive LTO inlining...\n";
+	F.addFnAttr(Attribute::AlwaysInline);
+	Changed = true;
+      }
     }
+        
+    return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  }
 };
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
@@ -816,28 +933,28 @@ llvmGetPassPluginInfo() {
     [](PassBuilder &PB) {
       
       PB.registerPipelineParsingCallback(
-        [](StringRef Name, FunctionPassManager &FPM,
-           ArrayRef<PassBuilder::PipelineElement>) {
-          if (Name == "io-opt") {
-            FPM.addPass(IOOptimisationPass()); 
-            return true;
-          }
-          return false;
-        });
+					 [](StringRef Name, FunctionPassManager &FPM,
+					    ArrayRef<PassBuilder::PipelineElement>) {
+					   if (Name == "io-opt") {
+					     FPM.addPass(IOOptimisationPass()); 
+					     return true;
+					   }
+					   return false;
+					 });
       
       PB.registerPipelineStartEPCallback(
-        [](ModulePassManager &MPM, OptimizationLevel Level) {
-          MPM.addPass(IOWrapperInlinePass());
-        });
+					 [](ModulePassManager &MPM, OptimizationLevel Level) {
+					   MPM.addPass(IOWrapperInlinePass());
+					 });
       
       PB.registerOptimizerLastEPCallback(
-        [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
-          MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass())); 
-        });
+					 [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+					   MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass())); 
+					 });
       
       PB.registerFullLinkTimeOptimizationLastEPCallback(
-        [](ModulePassManager &MPM, OptimizationLevel Level) {
-          MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass())); 
-        });
+							[](ModulePassManager &MPM, OptimizationLevel Level) {
+							  MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass())); 
+							});
     }};
 }
