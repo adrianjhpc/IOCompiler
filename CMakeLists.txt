@@ -40,7 +40,7 @@ if(LIT_TOOL)
         DEPENDS IOOpt
         
         # Print a nice message when it starts
-        COMMENT "Running IOOptimizationPass test suite..."
+        COMMENT "Running IOOptimisationPass test suite..."
         
         # Give lit direct access to the terminal so its colored output works
         USES_TERMINAL
@@ -49,6 +49,8 @@ else()
     message(WARNING "Could not find the 'lit' tool. The 'make check' target will not be created.")
     message(WARNING "You can install it via: pip install lit")
 endif()
+
+find_package(MPI)
 
 add_subdirectory(src)
 add_subdirectory(benchmarks)

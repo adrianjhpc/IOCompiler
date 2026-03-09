@@ -77,4 +77,34 @@ target_link_options(lto_fast PRIVATE -O3 -flto=full -fuse-ld=lld "-Wl,--load-pas
 
 add_dependencies(lto_fast IOOpt)
 
+# MPI-IO Benchmarks (HPC Evaluation)
+if(MPI_CXX_FOUND)
+    message(STATUS "MPI Found: Generating Baseline and Optimized Benchmarks")
+
+    # 1. The Baseline Binary (Compiled normally, no pass injected)
+    add_executable(mpi_write_at_standard mpi_write_at_benchmark.cpp)
+    target_link_libraries(mpi_write_at_standard PRIVATE MPI::MPI_CXX)
+    target_compile_options(mpi_write_at_standard PRIVATE -O3)
+
+    # 2. The Optimized Binary (Compiled with Full LTO and IOOpt injected)
+    add_executable(mpi_write_at_fast mpi_write_at_benchmark.cpp)
+    target_link_libraries(mpi_write_at_fast PRIVATE MPI::MPI_CXX)
+    
+    # Force LTO compilation
+    target_compile_options(mpi_write_at_fast PRIVATE -O3 -flto -fpass-plugin=$<TARGET_FILE:IOOpt>)
+    
+    # Inject the pass during the LLD Link phase
+    target_link_options(mpi_write_at_fast PRIVATE 
+        -fuse-ld=lld 
+        -flto 
+        -Wl,--load-pass-plugin=$<TARGET_FILE:IOOpt>
+    )
+    
+    # Ensure the plugin is compiled BEFORE the optimized benchmark tries to link
+    add_dependencies(mpi_write_at_fast IOOpt)
+
+else()
+    message(WARNING "MPI CXX compiler not found. Skipping MPI benchmarks")
+endif()
+
 

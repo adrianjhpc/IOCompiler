@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+
+import subprocess
+import re
+import argparse
+import hashlib
+import os
+import shutil
+
+def get_sha256(filepath):
+    """Calculates the SHA-256 hash of a file."""
+    sha256 = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            for block in iter(lambda: f.read(4096), b""):
+                sha256.update(block)
+        return sha256.hexdigest()
+    except Exception as e:
+        return None
+
+def run_and_trace(binary_path, np=1):
+    print(f"\n--- Running {binary_path} (MPI Ranks: {np}) ---")
+    
+    # We wrap the binary in strace, and wrap strace in mpirun
+    cmd = ["mpirun", "-np", str(np), "strace", "-c", binary_path]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        stdout_text = result.stdout
+        stderr_trace = result.stderr
+
+        # Extract Throughput from stdout
+        throughput_match = re.search(r'Throughput\s+:\s+([\d\.]+)\s+MB/s', stdout_text)
+        throughput = float(throughput_match.group(1)) if throughput_match else 0.0
+
+        # Extract syscalls from strace stderr output
+        def get_syscall_count(syscall_name):
+            pattern = rf'^\s*[\d\.]+\s+[\d\.]+\s+[\d\.]+\s+(\d+).*?\b{syscall_name}$'
+            match = re.search(pattern, stderr_trace, re.MULTILINE)
+            return int(match.group(1)) if match else 0
+
+        syscalls = {
+            "write": get_syscall_count("write"),
+            "writev": get_syscall_count("writev"),
+            "pwrite64": get_syscall_count("pwrite64"),
+            "pwritev": get_syscall_count("pwritev")
+        }
+        
+        return syscalls, throughput
+        
+    except Exception as e:
+        print(f"Error running benchmark {binary_path}: {e}")
+        return None, 0.0
+
+def main():
+    parser = argparse.ArgumentParser(description="Compare MPI I/O syscalls, throughput, and integrity.")
+    parser.add_argument("standard_exe", help="Path to the unoptimized executable")
+    parser.add_argument("fast_exe", help="Path to the optimized executable")
+    parser.add_argument("--np", dest="np", type=int, default=1, help="Number of MPI processes to spawn")
+    args = parser.parse_args()
+
+    TARGET_FILE = "mpi_ioopt_benchmark.dat"
+
+    # --- 1. Run Standard Benchmark ---
+    if os.path.exists(TARGET_FILE):
+        os.remove(TARGET_FILE)
+
+    std_data, std_throughput = run_and_trace(args.standard_exe, args.np)
+    std_hash = None
+
+    if os.path.exists(TARGET_FILE):
+        shutil.move(TARGET_FILE, "standard_mpi.out")
+        std_hash = get_sha256("standard_mpi.out")
+
+    # --- 2. Run Optimized Benchmark ---
+    if os.path.exists(TARGET_FILE):
+        os.remove(TARGET_FILE)
+
+    fast_data, fast_throughput = run_and_trace(args.fast_exe, args.np)
+    fast_hash = None
+
+    if os.path.exists(TARGET_FILE):
+        shutil.move(TARGET_FILE, "fast_mpi.out")
+        fast_hash = get_sha256("fast_mpi.out")
+
+    # --- 3. Print Performance & Syscall Results ---
+    if std_data is not None and fast_data is not None:
+        std_total = sum(std_data.values())
+        fast_total = sum(fast_data.values())
+
+        print("\n" + "="*55)
+        print(f"{'Metric':<15} | {'Baseline':<15} | {'Optimized':<15}")
+        print("-" * 55)
+        print(f"{'Throughput':<15} | {std_throughput:<10.2f} MB/s | {fast_throughput:<10.2f} MB/s")
+        print("-" * 55)
+        print(f"{'pwrite64':<15} | {std_data['pwrite64']:<15} | {fast_data['pwrite64']:<15}")
+        print(f"{'write':<15} | {std_data['write']:<15} | {fast_data['write']:<15}")
+        print(f"{'pwritev':<15} | {std_data['pwritev']:<15} | {fast_data['pwritev']:<15}")
+        print(f"{'writev':<15} | {std_data['writev']:<15} | {fast_data['writev']:<15}")
+        print("-" * 55)
+        print(f"{'TOTAL I/O CALLS':<15} | {std_total:<15} | {fast_total:<15}")
+        print("="*55)
+
+        if fast_total < std_total:
+            reduction = ((std_total - fast_total) / std_total) * 100
+            print(f"SUCCESS: Your pass reduced physical MPI-IO syscalls by {reduction:.2f}%")
+        else:
+            print("FAILURE: No I/O syscall reduction detected.")
+        print("="*55)
+
+    # --- 4. Print Integrity Results ---
+    print("\n" + "="*55)
+    print("DATA INTEGRITY CHECK:")
+    print(f"Baseline Hash : {std_hash or 'FILE NOT FOUND'}")
+    print(f"Optimized Hash: {fast_hash or 'FILE NOT FOUND'}")
+    print("-" * 55)
+    if std_hash and fast_hash and std_hash == fast_hash:
+        print("RESULT: EXACT MATCH (Mathematically Sound!)")
+    else:
+        print("RESULT: MISMATCH! (Data corruption detected)")
+    print("="*55)
+
+if __name__ == "__main__":
+    main()
