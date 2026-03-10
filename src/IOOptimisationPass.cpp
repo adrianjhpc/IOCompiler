@@ -60,8 +60,18 @@ namespace {
     if (Demangled == "fread")  return {Call->getArgOperand(3), Call->getArgOperand(0), Call->getArgOperand(2), IOArgs::C_FREAD};
 
     // Signature: (fh, offset, buf, count, datatype, status)
-    if (Demangled == "MPI_File_write_at" || Demangled == "PMPI_File_write_at") return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_WRITE_AT};
-    if (Demangled == "MPI_File_read_at" || Demangled == "PMPI_File_read_at")  return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_READ_AT};
+    if (Demangled.find("MPI_File_write_at") != std::string::npos || 
+    Demangled.find("PMPI_File_write_at") != std::string::npos ||
+    Demangled.find("ADIOI_") != std::string::npos) { // Catch internal ADIO calls
+    
+      return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_WRITE_AT};
+    }
+
+    if (Demangled.find("MPI_File_read_at") != std::string::npos || 
+    Demangled.find("PMPI_File_read_at") != std::string::npos) {
+    
+    return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_READ_AT};
+}
 
     // C++ Streams
     if ((Demangled.find("std::basic_ostream") != std::string::npos || 
@@ -191,7 +201,7 @@ namespace {
       if (!isContiguous) return false;
 
     } else if (NewArgs.Type == IOArgs::POSIX_READ || NewArgs.Type == IOArgs::POSIX_WRITE) {
-      // Implicit offsets natively guarantee contiguity if File Descriptors match!
+      // Implicit offsets natively guarantee contiguity if File Descriptors match
       if (NewArgs.Target != LastArgs.Target) return false; 
     }
 
@@ -697,92 +707,170 @@ struct IOOptimisationPass : public PassInfoMixin<IOOptimisationPass> {
   }
 
   bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL) {
-    BasicBlock *ExitBB = L->getExitBlock();
-    BasicBlock *Preheader = L->getLoopPreheader();
-    if (!ExitBB || !Preheader) return false;
+    std::string FuncName = L->getHeader()->getParent()->getName().str();
+    errs() << "[IOOpt-Debug] Entering loop in " << FuncName << "\n";
 
-    unsigned TripCount = SE.getSmallConstantTripCount(L);
-    if (TripCount == 0) return false;
+    BasicBlock *Preheader = L->getLoopPreheader();
+    if (!Preheader) {
+        errs() << "[IOOpt-Debug]   FAIL: No Preheader (Loop not simplified)\n";
+        return false;
+    }
+
+    // Instead of bailing on multiple exits, find the one that isn't an error return.
+    SmallVector<BasicBlock *, 4> ExitBlocks;
+    L->getExitBlocks(ExitBlocks);
+    
+    BasicBlock *SuccessExit = nullptr;
+    for (BasicBlock *EB : ExitBlocks) {
+        // A "Success Exit" is one that does not end in a ReturnInst (error-handling side exit)
+        // or it's the most common successor in the CFG.
+        if (!isa<ReturnInst>(EB->getTerminator())) {
+            SuccessExit = EB;
+            break;
+        }
+    }
+
+    // Fallback: If we still can't find a unique success path, we must bail.
+    if (!SuccessExit) {
+        errs() << "[IOOpt-Debug] FAIL: Could not identify a non-returning Success Exit in " << FuncName << "\n";
+        return false;
+    }
+
+    const SCEV *BTC = SE.getBackedgeTakenCount(L);
+    const SCEV *TripCountSCEV = nullptr;
+
+    if (!isa<SCEVCouldNotCompute>(BTC)) {
+        // Standard Case
+        TripCountSCEV = SE.getAddExpr(BTC, SE.getOne(BTC->getType()));
+    } else {
+        // Manual Case: Find the induction variable and its bound
+        std::optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
+    if (Bounds) {
+        Value &Initial = Bounds->getInitialIVValue();
+        Value &Final = Bounds->getFinalIVValue();
+        
+        // Compute: Final - Initial
+        const SCEV *InitialSCEV = SE.getSCEV(&Initial);
+        const SCEV *FinalSCEV = SE.getSCEV(&Final);
+        TripCountSCEV = SE.getMinusSCEV(FinalSCEV, InitialSCEV);
+        
+        errs() << "[IOOpt-Debug] Manually recovered Loop Bounds for " << FuncName << "\n";
+    }
+    }
+
+    if (!TripCountSCEV || isa<SCEVCouldNotCompute>(TripCountSCEV)) {
+        errs() << "[IOOpt-Debug] FAIL: Total Trip Count still uncomputable in " 
+               << L->getHeader()->getParent()->getName() << "\n";
+        return false;
+    }
 
     bool LoopChanged = false;
 
-    // Inside optimiseLoopIO loop
     for (BasicBlock *BB : L->blocks()) {
-      // Allow the block to have a branch if one side is a "Side-Exit" (return)
-      // and the other side stays within the loop.
-      Instruction *Term = BB->getTerminator();
-      if (auto *BI = dyn_cast<BranchInst>(Term)) {
-	if (BI->isConditional()) {
-	  bool LeadsToExit = false;
-	  for (BasicBlock *Succ : BI->successors()) {
-	    if (L->isLoopExiting(Succ) && isa<ReturnInst>(Succ->getTerminator())) {
-	      LeadsToExit = true;
-	    }
-	  }
-	  // If this is just a standard error check, it's safe to ignore for hoisting
-	  if (!LeadsToExit) continue; 
-	}
-      }
+        errs() << "[IOOpt-Debug]   Scanning Block: " << BB->getName() << "\n";
+        for (Instruction &I : llvm::make_early_inc_range(*BB)) {
+            auto *Call = dyn_cast<CallInst>(&I);
+            if (!Call) continue;
 
-      for (Instruction &I : llvm::make_early_inc_range(*BB)) {
-	if (auto *Call = dyn_cast<CallInst>(&I)) {
-	  IOArgs Args = getIOArguments(Call);
+            IOArgs Args = getIOArguments(Call);
+            if (Args.Type == IOArgs::NONE) continue;
+
+            errs() << "[IOOpt-Debug]     Found I/O Call: " << Args.Type << "\n";
+
+            // 1. Memory Contiguity Check
+            const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
+const SCEV *LenSCEV = SE.getSCEV(Args.Length);
+Value *BasePointer = nullptr;
+
+if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
+    if (AddRec->getLoop() == L) {
+        const SCEV *Step = AddRec->getStepRecurrence(SE);
+        
+        // Handle the "Type Multiplier" - If Step > Len, it's likely writing multi-byte elements
+        // This is common in MPI where count is elements, but Step is bytes.
+        bool Contiguous = (Step == LenSCEV || SE.getTruncateOrZeroExtend(LenSCEV, Step->getType()) == Step);
+        
+        // Fallback: If Step is a multiple of Len, it might still be contiguous
+        // (e.g., writing 1 int (4 bytes) per iteration)
+        if (!Contiguous && isa<SCEVConstant>(Step) && isa<SCEVConstant>(LenSCEV)) {
+             uint64_t StepVal = cast<SCEVConstant>(Step)->getValue()->getZExtValue();
+             uint64_t LenVal = cast<SCEVConstant>(LenSCEV)->getValue()->getZExtValue();
+             if (StepVal > 0 && LenVal > 0) Contiguous = true; 
+        }
+
+        if (Contiguous) {
+             SCEVExpander Expander(SE, DL, "io.base");
+             BasePointer = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), Preheader->getTerminator());
+        } else {
+            errs() << "[IOOpt-Debug]       FAIL: Step " << *Step << " != Len " << *LenSCEV << "\n";
+        }
+    }
+}
+
+            // 2. Disk Offset Check
+            Value *StartingOffset = nullptr;
+if (Args.Type == IOArgs::MPI_WRITE_AT || Args.Type == IOArgs::MPI_READ_AT) {
+    Value *OffsetOp = Call->getArgOperand(1); // Arg 1 is Offset
+    const SCEV *OffSCEV = SE.getSCEV(OffsetOp);
+    
+    if (auto *AddRecOff = dyn_cast<SCEVAddRecExpr>(OffSCEV)) {
+        const SCEV *StepOff = AddRecOff->getStepRecurrence(SE);
+        
+        // Normalize bit-widths! (i32 loop counter vs i64 disk offset)
+        const SCEV *NormalizedLen = SE.getTruncateOrZeroExtend(LenSCEV, StepOff->getType());
+        
+        if (StepOff == NormalizedLen || (isa<SCEVConstant>(StepOff) && isa<SCEVConstant>(NormalizedLen))) {
+            SCEVExpander OffExpander(SE, DL, "io.off");
+            StartingOffset = OffExpander.expandCodeFor(AddRecOff->getStart(), OffsetOp->getType(), Preheader->getTerminator());
+        } else {
+            errs() << "[IOOpt-Debug]       FAIL: Offset Step " << *StepOff << " mismatch with Len\n";
+        }
+    }
+}
+
+            // 3. Transformation (Reconstruction)
+            IRBuilder<> ExitBuilder(&*SuccessExit->getFirstInsertionPt());
             
-	  if (Args.Type == IOArgs::POSIX_WRITE || Args.Type == IOArgs::POSIX_READ) {
-                
-	    auto *ConstLen = dyn_cast<ConstantInt>(Args.Length);
-	    if (!ConstLen) continue;
+            const SCEV *TripCountSCEV = SE.getAddExpr(BTC, SE.getOne(BTC->getType()));
+            SCEVExpander TripExpander(SE, DL, "trip.count");
+            Value *VTripCount = TripExpander.expandCodeFor(TripCountSCEV, Args.Length->getType(), ExitBuilder.GetInsertPoint());
+            Value *TotalLenVal = ExitBuilder.CreateMul(VTripCount, Args.Length, "hoisted.total.len");
 
-	    uint64_t ElementSize = ConstLen->getZExtValue();
-	    uint64_t TotalBytes = ElementSize * TripCount;
+            if (Args.Type == IOArgs::MPI_WRITE_AT || Args.Type == IOArgs::MPI_READ_AT) {
+                std::vector<Value *> NewArgs = {Call->getArgOperand(0), StartingOffset, BasePointer, TotalLenVal, Call->getArgOperand(4), Call->getArgOperand(5)};
+                ExitBuilder.CreateCall(Call->getCalledFunction(), NewArgs);
+            } else {
+                ExitBuilder.CreateCall(Call->getCalledFunction(), {Args.Target, BasePointer, TotalLenVal});
+            }
 
-	    if (TotalBytes > IOHighWaterMark) continue;
+            // Ensure the replacement matches the expected return type (e.g., i32 vs i64)
+            if (!Call->use_empty()) {
+                Value *Replacement = Args.Length;
+                if (Call->getType() != Args.Length->getType()) {
+                    IRBuilder<> CastBuilder(Call);
+                    Replacement = CastBuilder.CreateIntCast(Args.Length, Call->getType(), true);
+                }
+                Call->replaceAllUsesWith(Replacement);
+            }
 
-	    if (!L->isLoopInvariant(Args.Target)) continue;
+            // Clear all internal references within the instruction before deletion
+            // This prevents ConstantHoisting from trying to inspect operands of a dead instruction
+            Call->dropAllReferences(); 
 
-	    const SCEV *PtrSCEV = SE.getSCEV(Args.Buffer);
-	    Value *BasePointer = nullptr;
+            errs() << "[IOOpt] SUCCESS: Hoisted and Cleaned Multi-Exit Loop I/O in " << FuncName << "\n";
 
-	    if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(PtrSCEV)) {
-	      if (AddRec->getLoop() == L) {
-		if (auto *StepConst = dyn_cast<SCEVConstant>(AddRec->getStepRecurrence(SE))) {
-		  if (StepConst->getValue()->getZExtValue() == ElementSize) {
-		    SCEVExpander Expander(SE, DL, "io.base.expander");
-		    BasePointer = Expander.expandCodeFor(AddRec->getStart(), Args.Buffer->getType(), Preheader->getTerminator());
-		  }
-		}
-	      }
-	    } else if (SE.isLoopInvariant(PtrSCEV, L)) {
-	      SCEVExpander Expander(SE, DL, "io.base.expander");
-	      BasePointer = Expander.expandCodeFor(PtrSCEV, Args.Buffer->getType(), Preheader->getTerminator());
-	    }
-
-	    if (!BasePointer) continue;
-
-	    IRBuilder<> ExitBuilder(&*ExitBB->getFirstInsertionPt());
-	    Value *TotalLenVal = ExitBuilder.getIntN(Args.Length->getType()->getIntegerBitWidth(), TotalBytes);
-              
-	    std::vector<Value *> NewArgs = {Args.Target, BasePointer, TotalLenVal};
-	    ExitBuilder.CreateCall(Call->getCalledFunction(), NewArgs);
- 
-	    if (!Call->use_empty()) {
-	      Call->replaceAllUsesWith(Args.Length);
-	    }
-
-
-	    errs() << "[IOOpt] SUCCESS: Hoisted Loop POSIX I/O! Scaled " << ElementSize 
-		   << " bytes * " << TripCount << " iterations = " << TotalBytes << " bytes at loop exit.\n";
-
-	    Call->eraseFromParent();
-	    LoopChanged = true;
-	  }
-	}
-      }
+            // Final Erase
+            Call->eraseFromParent();
+            
+            // Stop processing this loop and return true immediately.
+            // This forces the Pass Manager to refresh ScalarEvolution and other analyses.
+            return true;
+        }
     }
     return LoopChanged;
-  }
-
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+}   
+ 
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
     errs() << "[IOOpt] Analysing function: " << F.getName() << "\n";
     bool Changed = false;
 
@@ -874,6 +962,7 @@ struct IOOptimisationPass : public PassInfoMixin<IOOptimisationPass> {
     }
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
+
 };
 
 
@@ -928,6 +1017,7 @@ llvmGetPassPluginInfo() {
 					 [](StringRef Name, FunctionPassManager &FPM,
 					    ArrayRef<PassBuilder::PipelineElement>) {
 					   if (Name == "io-opt") {
+					     FPM.addPass(LoopSimplifyPass());
 					     FPM.addPass(IOOptimisationPass()); 
 					     return true;
 					   }
