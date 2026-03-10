@@ -13,6 +13,7 @@
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/IR/Dominators.h"
 
 #include <vector>
 #include <cstdlib>
@@ -114,11 +115,16 @@ namespace {
     return false;
   }
 
-  bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL, ScalarEvolution &SE) {
+  bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL, ScalarEvolution &SE, DominatorTree &DT) {
     errs() << "[IOOpt-Debug] Attempting to add " << *NewCall << " to batch of size " << Batch.size() << "\n";
     if (Batch.empty()) return true;
 
     CallInst *LastCall = Batch.back();
+
+    if (!DT.dominates(LastCall, NewCall)) {
+        errs() << "[IOOpt-Debug] Batch Break: CFG Dominance violation.\n";
+        return false;
+    }
 
     if (LastCall->getCalledFunction() != NewCall->getCalledFunction()) {
       errs() << "[IOOpt-Debug] Batch Break: Function mismatch.\n";
@@ -859,6 +865,7 @@ namespace {
       const DataLayout &DL = F.getParent()->getDataLayout();
       LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
       ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+      DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
 
       for (Loop *L : LI.getLoopsInPreorder()) {
         if (optimiseLoopIO(L, SE, DL)) Changed = true;
@@ -935,7 +942,7 @@ namespace {
               }
 
               // Check for memory/disk hazards using our cross-block scanner
-              if (isSafeToAddToBatch(IOBatch, Call, AA, DL, SE)) {
+              if (isSafeToAddToBatch(IOBatch, Call, AA, DL, SE, DT)) {
                 IOBatch.push_back(Call);
                 CurrentBatchBytes += CallBytes;
 
