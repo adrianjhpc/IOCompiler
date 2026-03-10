@@ -438,7 +438,12 @@ namespace {
     }
 
     if (Batch.size() >= DynamicThreshold) {
-      if (FirstArgs.Type != IOArgs::MPI_READ_AT && FirstArgs.Type != IOArgs::MPI_WRITE_AT) {
+      // Only raw POSIX supports Vectored I/O (readv/writev/preadv/pwritev)
+      // fwrite, CXX_WRITE, and MPI must fall through to ShadowBuffering
+      if (FirstArgs.Type == IOArgs::POSIX_READ || 
+          FirstArgs.Type == IOArgs::POSIX_WRITE || 
+          FirstArgs.Type == IOArgs::POSIX_PREAD || 
+          FirstArgs.Type == IOArgs::POSIX_PWRITE) {
         return IOPattern::Vectored;
       }
     }
