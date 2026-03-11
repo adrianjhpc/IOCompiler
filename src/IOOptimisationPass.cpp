@@ -543,7 +543,7 @@ namespace {
     // Vectored I/O
     size_t DynamicThreshold = 2;//IOBatchThreshold; // Defaults to 4
     
-/*    if (isRead) {
+    if (isRead) {
       DynamicThreshold = 2; 
     } else {
       Function *F = Batch.back()->getFunction();
@@ -566,7 +566,7 @@ namespace {
 	}
       }
     }
-*/
+
     if (Batch.size() >= DynamicThreshold) {
       // Only raw POSIX supports Vectored I/O (readv/writev/preadv/pwritev)
       // fwrite, CXX_WRITE, and MPI must fall through to ShadowBuffering
