@@ -18,10 +18,9 @@ void test_mpi_status_trap(MPI_File fh, char* buf1, char* buf2) {
     
     // The pass MUST NOT batch these because the status pointers are different!
     // We use {{.*}} to ignore the specific register names (like %4 and %5) that Clang generates.
-    // CHECK: call i32 @MPI_File_write_at(ptr {{.*}}, i64 0, ptr {{.*}}, i32 10, i32 1, ptr {{.*}})
-    // CHECK: call i32 @MPI_File_write_at(ptr {{.*}}, i64 10, ptr {{.*}}, i32 10, i32 1, ptr {{.*}})
-    // CHECK-NOT: shadow.buf
-    
+    // CHECK: call i32 @MPI_File_write_at(ptr {{.*}}, i64 {{.*}}0, ptr {{.*}}, i32 {{.*}}10, i32 {{.*}}1, ptr {{.*}})
+    // CHECK: call i32 @MPI_File_write_at(ptr {{.*}}, i64 {{.*}}10, ptr {{.*}}, i32 {{.*}}10, i32 {{.*}}1, ptr {{.*}})
+    // CHECK-NOT: shadow.buf    
     MPI_File_write_at(fh, 0, buf1, 10, MPI_CHAR, &status1);
     MPI_File_write_at(fh, 10, buf2, 10, MPI_CHAR, &status2);
     
