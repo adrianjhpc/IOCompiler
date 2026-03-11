@@ -4,16 +4,24 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/CGSCCPassManager.h"
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#include "llvm/Transforms/IPO/FunctionAttrs.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/IR/Dominators.h"
+#include "llvm/ADT/SmallPtrSet.h"
+
+
 
 #include <vector>
 #include <cstdlib>
@@ -132,7 +140,7 @@ namespace {
     return false;
   }
 
-  bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL, ScalarEvolution &SE, DominatorTree &DT) {
+  bool isSafeToAddToBatch(const std::vector<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL, ScalarEvolution &SE, DominatorTree &DT, PostDominatorTree &PDT) {
     errs() << "[IOOpt-Debug] Attempting to add " << *NewCall << " to batch of size " << Batch.size() << "\n";
     if (Batch.empty()) return true;
 
@@ -142,20 +150,20 @@ namespace {
     IOArgs LastArgs = getIOArguments(LastCall);
     IOArgs NewArgs = getIOArguments(NewCall);
 
-    if (LastCall->getParent() != NewCall->getParent()) {
-      // We only permit cross-block batching for raw POSIX calls. This allows us to 
-      // aggressively bypass standard 'if (bytes < 0)' system call error checks. 
-      // Buffered streams (fwrite, C++) and MPI are strictly restricted to the same block 
-      // to prevent text from being lost across un-spoofable application logic branches.
-      if (FirstArgs.Type != IOArgs::POSIX_WRITE && 
-	  FirstArgs.Type != IOArgs::POSIX_PWRITE && 
-	  FirstArgs.Type != IOArgs::POSIX_READ && 
-	  FirstArgs.Type != IOArgs::POSIX_PREAD) {
+    /*    if (LastCall->getParent() != NewCall->getParent()) {
+    // We only permit cross-block batching for raw POSIX calls. This allows us to 
+    // aggressively bypass standard 'if (bytes < 0)' system call error checks. 
+    // Buffered streams (fwrite, C++) and MPI are strictly restricted to the same block 
+    // to prevent text from being lost across un-spoofable application logic branches.
+    if (FirstArgs.Type != IOArgs::POSIX_WRITE && 
+    FirstArgs.Type != IOArgs::POSIX_PWRITE && 
+    FirstArgs.Type != IOArgs::POSIX_READ && 
+    FirstArgs.Type != IOArgs::POSIX_PREAD) {
             
-	errs() << "[IOOpt-Debug] Batch Break: Cross-block batching disabled for non-POSIX type.\n";
-	return false;
-      }
+    errs() << "[IOOpt-Debug] Batch Break: Cross-block batching disabled for non-POSIX type.\n";
+    return false;
     }
+    }*/
 
     if (!DT.dominates(LastCall, NewCall)) {
       errs() << "[IOOpt-Debug] Batch Break: CFG Dominance violation.\n";
@@ -309,51 +317,128 @@ namespace {
     MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
 
     // Hazard Scanning Loop (Cross-Block Support)
-    Instruction *CurrInst = LastCall->getNextNode();
-    BasicBlock *CurrBB = LastCall->getParent();
+    BasicBlock *BB1 = LastCall->getParent();
+    BasicBlock *BB2 = NewCall->getParent();
 
-    // Hazard Scanning Loop (Strictly Intra-Block)
-    while (CurrInst != NewCall) {
-      if (!CurrInst) {
-        // We reached the end of the block. Since we have sinkWrite/hoistRead,
-        // we strictly limit batching to intra-block to prevent false CFG hazards.
+    if (BB1 != BB2) {
+      // RULE 1: Dominance. BB1 must execute before BB2.
+      if (!DT.dominates(BB1, BB2)) return false;
+
+      // RULE 2: Post-Dominance. 
+      // Buffered streams (fwrite, C++) MUST guarantee BB2 executes if BB1 executes 
+      // so we don't lose text. POSIX calls can safely ignore this rule because our 
+      // return-value spoofing makes their error branches dead code.
+      bool isBuffered = (FirstArgs.Type != IOArgs::POSIX_WRITE && 
+                         FirstArgs.Type != IOArgs::POSIX_PWRITE && 
+                         FirstArgs.Type != IOArgs::POSIX_READ && 
+                         FirstArgs.Type != IOArgs::POSIX_PREAD);
+                         
+      if (isBuffered && !PDT.dominates(BB2, BB1)) {
         return false;
       }
+    }
 
-      // Opaque Barriers and Lifetimes
-      if (auto *CI = dyn_cast<CallInst>(CurrInst)) {
-        // We stripped lifetime markers in Phase 0, so we no longer check for them here.
-        
-        // Hazard: Never batch across another I/O call
-        if (getIOArguments(CI).Type != IOArgs::NONE) return false;
-        
-        // Hazard: Never batch across an opaque function that might write to memory
-        if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
+    // --- The Hazard Checker Lambda ---
+    auto checkHazard = [&](Instruction *Inst) -> bool {
+      if (auto *CI = dyn_cast<CallInst>(Inst)) {
+        if (getIOArguments(CI).Type != IOArgs::NONE){
+	  errs() << "[IOOpt-Debug] Batch Break: Intervening I/O call found.\n";
+	  return true;
+	}
+        if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()){
+	  errs() << "[IOOpt-Debug] Batch Break: Opaque function mutation (" 
+		 << (CI->getCalledFunction() ? CI->getCalledFunction()->getName() : "indirect call") << ").\n";
+	  return true;
+	}
       }
 
-      if (CurrInst->mayReadOrWriteMemory()) {
-        if (isModSet(AA.getModRefInfo(CurrInst, NewLoc))) return false;
+      if (Inst->mayReadOrWriteMemory()) {
+        
+        // Check the New Buffer
+        if (isModSet(AA.getModRefInfo(Inst, NewLoc))) {
+	  // Is it a local stack variable that never escaped?
+	  if (isa<AllocaInst>(NewLoc.Ptr) && !PointerMayBeCaptured(NewLoc.Ptr, true, true)) {
+	    // False alarm! The opaque function can't possibly know this address.
+	  } else {
+	    errs() << "[IOOpt-Debug] Batch Break: Target buffer overwritten.\n";
+	    return true;
+	  }
+        }
 
+        // Check the Previously Batched Buffers
         for (CallInst *BatchedCall : Batch) {
           IOArgs BArgs = getIOArguments(BatchedCall);
           MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
-          if (isModSet(AA.getModRefInfo(CurrInst, BLoc))) return false;
+          
+          if (isModSet(AA.getModRefInfo(Inst, BLoc))) {
+	    // Is it a local stack variable that never escaped?
+	    if (isa<AllocaInst>(BLoc.Ptr) && !PointerMayBeCaptured(BLoc.Ptr, true, true)) {
+	    } else {
+	      errs() << "[IOOpt-Debug] Batch Break: Previously batched buffer overwritten.\n";
+	      return true;
+	    }
+          }
         }
 
+        // Check the Target / FD (These stay exactly the same)
         if (FirstArgs.Target->getType()->isPointerTy()) {
           MemoryLocation TargetLoc(FirstArgs.Target, LocationSize::beforeOrAfterPointer());
-          if (isModSet(AA.getModRefInfo(CurrInst, TargetLoc))) return false;
+          if (isModSet(AA.getModRefInfo(Inst, TargetLoc))) return true;
         }
-          
         if (Load1) {
           MemoryLocation FdLoc(Load1->getPointerOperand(), LocationSize::beforeOrAfterPointer());
-          if (isModSet(AA.getModRefInfo(CurrInst, FdLoc))) return false;
+          if (isModSet(AA.getModRefInfo(Inst, FdLoc))) return true;
         }
       }
-      CurrInst = CurrInst->getNextNode();
+
+      return false; // No hazard found
+    };
+
+    // --- Phase 1: Scan the rest of the first block ---
+    for (Instruction *I = LastCall->getNextNode(); I != nullptr; I = I->getNextNode()) {
+      if (I == NewCall) return true; // Found it in the same block safely!
+      if (checkHazard(I)) return false;
     }
 
-    return true;
+    // If they are in the same block, we would have returned above. 
+    // If we reach here, it's a cross-block batch.
+    
+    // --- Phase 2: Traverse intervening CFG blocks (Breadth-First Search) ---
+    SmallPtrSet<BasicBlock*, 8> Visited;
+    std::vector<BasicBlock*> Worklist;
+    
+    for (BasicBlock *Succ : successors(BB1)) {
+      if (Succ != BB2) {
+        Worklist.push_back(Succ);
+        Visited.insert(Succ);
+      }
+    }
+
+    while (!Worklist.empty()) {
+      BasicBlock *CurrBB = Worklist.back();
+      Worklist.pop_back();
+
+      for (Instruction &I : *CurrBB) {
+        if (checkHazard(&I)) return false;
+      }
+
+      for (BasicBlock *Succ : successors(CurrBB)) {
+        // If we hit a loop backedge that goes behind BB1, abort!
+        if (!DT.dominates(BB1, Succ)) return false; 
+        
+        if (Succ != BB2 && Visited.insert(Succ).second) {
+          Worklist.push_back(Succ);
+        }
+      }
+    }
+
+    // --- Phase 3: Scan the final block up to NewCall ---
+    for (Instruction &I : *BB2) {
+      if (&I == NewCall) break; // Reached the target safely!
+      if (checkHazard(&I)) return false;
+    }
+
+    return true; // Successfully proved the CFG path is clear!
   }
 
   // ====================================================================
@@ -363,6 +448,7 @@ namespace {
     Contiguous,   // Perfectly sequential memory (array[0], array[1])
     Strided,      // Uniform scattered sizes perfect for SIMD Gather
     ShadowBuffer, // Small scattered writes we can safely pack on the stack
+    DynamicShadowBuffer, // Scattered writes we can safely pack on the heap 
     Vectored,     // Heavy scattered I/O (Requires readv/writev arrays)
     Unprofitable  // Too few calls or lacks byte-weight. Do not optimise
   };
@@ -443,7 +529,6 @@ namespace {
     if (StrictPhysical) return IOPattern::Contiguous;
 
     // Strided Pattern
-    // Strided Pattern
     if (isStridedPattern(Batch, DL, SE)) {
       if (auto *ConstLen = dyn_cast<ConstantInt>(getIOArguments(Batch.front()).Length)) {
         uint64_t ElementBytes = ConstLen->getZExtValue();
@@ -456,9 +541,9 @@ namespace {
     }
 
     // Vectored I/O
-    size_t DynamicThreshold = IOBatchThreshold; // Defaults to 4
+    size_t DynamicThreshold = 2;//IOBatchThreshold; // Defaults to 4
     
-    if (isRead) {
+/*    if (isRead) {
       DynamicThreshold = 2; 
     } else {
       Function *F = Batch.back()->getFunction();
@@ -481,7 +566,7 @@ namespace {
 	}
       }
     }
-
+*/
     if (Batch.size() >= DynamicThreshold) {
       // Only raw POSIX supports Vectored I/O (readv/writev/preadv/pwritev)
       // fwrite, CXX_WRITE, and MPI must fall through to ShadowBuffering
@@ -503,21 +588,29 @@ namespace {
       bool AllSizesConstant = true;
         
       for (CallInst *C : Batch) {
-	if (auto *CI = dyn_cast<ConstantInt>(getIOArguments(C).Length)) {
-	  TotalConstSize += CI->getZExtValue();
-	} else {
-	  AllSizesConstant = false;
-	  break;
-	}
+        if (auto *CI = dyn_cast<ConstantInt>(getIOArguments(C).Length)) {
+          TotalConstSize += CI->getZExtValue();
+        } else {
+          AllSizesConstant = false;
+          break;
+        }
       }
         
-      // If all sizes are known and fit comfortably on the stack
+      // 1. Static Shadow Buffer (Fast Stack)
       if (AllSizesConstant && TotalConstSize > 0 && TotalConstSize <= IOShadowBufferSize) {
-	OutTotalRange = TotalConstSize;
-	return IOPattern::ShadowBuffer;
+        OutTotalRange = TotalConstSize;
+        return IOPattern::ShadowBuffer;
+      }
+      
+      // 2. Dynamic Shadow Buffer (Heap Malloc)
+      // If we have at least 4 dynamic writes, it's worth paying the malloc penalty.
+      if (!AllSizesConstant && Batch.size() >= 4) {
+          return IOPattern::DynamicShadowBuffer;
       }
     }
-
+    errs() << "[IOOpt-Debug] Batch Unprofitable: Size=" << Batch.size() 
+           << ", ExpectedThreshold=" << DynamicThreshold 
+           << ", IsRead=" << isRead << "\n";
     return IOPattern::Unprofitable;
   }
 
@@ -674,6 +767,68 @@ namespace {
       break;
     }
 
+    case IOPattern::DynamicShadowBuffer: {
+      Type *SizeTy = DL.getIntPtrType(M->getContext());
+      Type *Int8Ty = Builder.getInt8Ty();
+      Type *PtrTy = Builder.getPtrTy();
+      
+      // 1. Get handles to the system malloc and free functions
+      FunctionCallee MallocFunc = M->getOrInsertFunction("malloc", PtrTy, SizeTy);
+      FunctionCallee FreeFunc = M->getOrInsertFunction("free", Builder.getVoidTy(), PtrTy);
+      
+      IRBuilder<> EndBuilder(Batch.back());
+      
+      // 2. Build the runtime math to sum up all the dynamic lengths
+      Value *TotalLen = EndBuilder.getIntN(SizeTy->getIntegerBitWidth(), 0);
+      std::vector<Value*> ExtendedLens;
+      for (CallInst *C : Batch) {
+          Value *Len = getIOArguments(C).Length;
+          if (Len->getType() != SizeTy) {
+              Len = EndBuilder.CreateZExtOrTrunc(Len, SizeTy, "dyn.len.ext");
+          }
+          ExtendedLens.push_back(Len);
+          TotalLen = EndBuilder.CreateAdd(TotalLen, Len, "dyn.sum");
+      }
+      
+      // 3. Inject the dynamic allocation: ptr = malloc(TotalLen)
+      Value *HeapBuf = EndBuilder.CreateCall(MallocFunc, {TotalLen}, "dyn.shadow.buf");
+      
+      // 4. Generate the runtime memcpy loops
+      Value *CurrentOffset = EndBuilder.getIntN(SizeTy->getIntegerBitWidth(), 0);
+      for (size_t i = 0; i < Batch.size(); ++i) {
+          CallInst *C = Batch[i];
+          IOArgs Args = getIOArguments(C);
+          Value *Len = ExtendedLens[i];
+          
+          Value *DestPtr = EndBuilder.CreateInBoundsGEP(Int8Ty, HeapBuf, CurrentOffset, "dyn.dest");
+          EndBuilder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
+          CurrentOffset = EndBuilder.CreateAdd(CurrentOffset, Len, "dyn.offset");
+      }
+      
+      // 5. Issue the single merged system call
+      std::vector<Value *> NewArgs;
+      Value *OriginalLenTy = EndBuilder.CreateZExtOrTrunc(TotalLen, FirstArgs.Length->getType());
+      
+      if (FirstArgs.Type == IOArgs::MPI_WRITE_AT) {
+        NewArgs = { Batch[0]->getArgOperand(0), Batch[0]->getArgOperand(1), HeapBuf, OriginalLenTy, Batch[0]->getArgOperand(4), Batch[0]->getArgOperand(5) };
+      } else if (FirstArgs.Type == IOArgs::C_FWRITE) {
+        Value *SizeOne = EndBuilder.getIntN(OriginalLenTy->getType()->getIntegerBitWidth(), 1);
+        NewArgs = {HeapBuf, SizeOne, OriginalLenTy, FirstArgs.Target};
+      } else if (isExplicit) {
+        NewArgs = {FirstArgs.Target, HeapBuf, OriginalLenTy, Batch[0]->getArgOperand(3)};
+      } else {
+        NewArgs = {FirstArgs.Target, HeapBuf, OriginalLenTy};
+      }
+      
+      MergedCall = EndBuilder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
+      
+      // 6. Instantly free the memory: free(ptr)
+      EndBuilder.CreateCall(FreeFunc, {HeapBuf});
+      
+      errs() << "[IOOpt] SUCCESS: Dynamic Heap Buffered " << Batch.size() << " writes!\n";
+      break;
+    }
+
     case IOPattern::Vectored: {
       Type *Int32Ty = Builder.getInt32Ty();
       Type *PtrTy = PointerType::getUnqual(M->getContext());
@@ -778,16 +933,22 @@ namespace {
             // Hazard: Never hoist past an opaque function that might write memory
             if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) break;
           }          
-          
-          if (CurrentInst->mayReadOrWriteMemory()) {
-            if (isModOrRefSet(AA.getModRefInfo(CurrentInst, DestLoc))) break;
+
+	  if (CurrentInst->mayReadOrWriteMemory()) {
+            if (isModOrRefSet(AA.getModRefInfo(CurrentInst, DestLoc))) {
+	      if (isa<AllocaInst>(DestLoc.Ptr) && !PointerMayBeCaptured(DestLoc.Ptr, true, true)) {
+		// False alarm, keep hoisting
+                } else {
+                    break; // Real hazard
+                }
+            }
             
             if (Args.Target->getType()->isPointerTy()) {
-	      MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
-	      if (isModSet(AA.getModRefInfo(CurrentInst, TargetLoc))) break;
+                MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
+                if (isModSet(AA.getModRefInfo(CurrentInst, TargetLoc))) break;
             }
           }
-
+	  
           InsertPoint = CurrentInst;
         }
         CurrentInst = CurrentInst->getPrevNode();
@@ -820,18 +981,31 @@ namespace {
       if (CurrentInst->mayThrow()) break;
 
       if (auto *CI = dyn_cast<CallInst>(CurrentInst)) {
-        if (getIOArguments(CI).Type != IOArgs::NONE) return false;
-        if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) return false;
+        if (getIOArguments(CI).Type != IOArgs::NONE){
+	  errs() << "[IOOpt-Debug] Code Motion Blocked: Hit another I/O call.\n";
+	  return false;
+	}
+        if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()){
+	  errs() << "[IOOpt-Debug] Code Motion Blocked: Hit opaque function call.\n";
+	  return false;
+	}
       }
-      
+
       if (CurrentInst->mayReadOrWriteMemory()) {
-        if (isModSet(AA.getModRefInfo(CurrentInst, SrcLoc))) break;
+        if (isModSet(AA.getModRefInfo(CurrentInst, SrcLoc))) {
+            if (isa<AllocaInst>(SrcLoc.Ptr) && !PointerMayBeCaptured(SrcLoc.Ptr, true, true)) {
+                // False alarm! Keep sinking!
+            } else {
+                break; // Real hazard, stop moving the instruction
+            }
+        }
         
         if (Args.Target->getType()->isPointerTy()) {
-	  MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
-	  if (isModSet(AA.getModRefInfo(CurrentInst, TargetLoc))) break;
+          MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
+          if (isModSet(AA.getModRefInfo(CurrentInst, TargetLoc))) break;
         }
       }
+      
       
       InsertPoint = CurrentInst;
       CurrentInst = CurrentInst->getNextNode();
@@ -960,7 +1134,8 @@ namespace {
       LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
       ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
       DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-
+      PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
+      
       for (Loop *L : LI.getLoopsInPreorder()) {
         if (optimiseLoopIO(L, SE, DL)) Changed = true;
       }
@@ -989,7 +1164,7 @@ namespace {
         }
       }
      
-      // Phase 4: Function-level batching (Cross-Block)
+      // Phase 4: Intra-Block
       std::vector<CallInst*> IOBatch;
       uint64_t CurrentBatchBytes = 0;
 
@@ -1037,7 +1212,7 @@ namespace {
               }
 
               // Check for memory/disk hazards using our cross-block scanner
-              if (isSafeToAddToBatch(IOBatch, Call, AA, DL, SE, DT)) {
+              if (isSafeToAddToBatch(IOBatch, Call, AA, DL, SE, DT, PDT)) {
                 IOBatch.push_back(Call);
                 CurrentBatchBytes += CallBytes;
 
@@ -1126,9 +1301,14 @@ llvmGetPassPluginInfo() {
 					 [](ModulePassManager &MPM, OptimizationLevel Level) {
 					   MPM.addPass(IOWrapperInlinePass());
 					 });
+
       
       PB.registerOptimizerLastEPCallback(
 					 [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+					   // 1. Force LLVM to deduce memory attributes using the Call Graph Adaptor
+					   MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(PostOrderFunctionAttrsPass()));
+					   
+					   // 2. Then run our I/O optimization using the Function Pass Adaptor
 					   MPM.addPass(createModuleToFunctionPassAdaptor(IOOptimisationPass())); 
 					 });
       
