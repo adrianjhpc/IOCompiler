@@ -137,6 +137,25 @@ namespace {
     if (Batch.empty()) return true;
 
     CallInst *LastCall = Batch.back();
+    
+    IOArgs FirstArgs = getIOArguments(Batch.front());
+    IOArgs LastArgs = getIOArguments(LastCall);
+    IOArgs NewArgs = getIOArguments(NewCall);
+
+    if (LastCall->getParent() != NewCall->getParent()) {
+        // We only permit cross-block batching for raw POSIX calls. This allows us to 
+        // aggressively bypass standard 'if (bytes < 0)' system call error checks. 
+        // Buffered streams (fwrite, C++) and MPI are strictly restricted to the same block 
+        // to prevent text from being lost across un-spoofable application logic branches.
+        if (FirstArgs.Type != IOArgs::POSIX_WRITE && 
+            FirstArgs.Type != IOArgs::POSIX_PWRITE && 
+            FirstArgs.Type != IOArgs::POSIX_READ && 
+            FirstArgs.Type != IOArgs::POSIX_PREAD) {
+            
+            errs() << "[IOOpt-Debug] Batch Break: Cross-block batching disabled for non-POSIX type.\n";
+            return false;
+        }
+    }
 
     if (!DT.dominates(LastCall, NewCall)) {
         errs() << "[IOOpt-Debug] Batch Break: CFG Dominance violation.\n";
@@ -147,10 +166,6 @@ namespace {
       errs() << "[IOOpt-Debug] Batch Break: Function mismatch.\n";
       return false;
     }
-
-    IOArgs FirstArgs = getIOArguments(Batch.front());
-    IOArgs LastArgs = getIOArguments(LastCall);
-    IOArgs NewArgs = getIOArguments(NewCall);
 
     if (LastCall->getCalledFunction() != NewCall->getCalledFunction()) {
       errs() << "[IOOpt-Debug] Batch Break: Function mismatch.\n";
@@ -603,71 +618,58 @@ namespace {
       errs() << "[IOOpt] SUCCESS: SIMD Gathered " << NumElements << " strided writes into 1!\n";
       break;
     }
+
     case IOPattern::ShadowBuffer: {
       Function *F = Batch.back()->getFunction();
-      // Move the Alloca to the Entry Block (standard LLVM practice)
       IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
 
       Type *Int8Ty = Builder.getInt8Ty();
       ArrayType *ShadowArrTy = ArrayType::get(Int8Ty, TotalConstSize);
       AllocaInst *ShadowBuf = EntryBuilder.CreateAlloca(ShadowArrTy, nullptr, "shadow.buf");
-      ShadowBuf->setAlignment(Align(16)); // Sane alignment for general use
+      ShadowBuf->setAlignment(Align(16)); 
 
-      // Pack the data into the buffer
       uint64_t CurrentOffset = 0;
       for (size_t i = 0; i < Batch.size(); ++i) {
-        IOArgs Args = getIOArguments(Batch[i]);
+        CallInst *C = Batch[i];
+        IOArgs Args = getIOArguments(C);
 
-        // Calculate the destination pointer inside our shadow buffer
-        Value *DestPtr = Builder.CreateInBoundsGEP(
-						   ShadowArrTy, ShadowBuf,
-						   {Builder.getInt32(0), Builder.getInt32(CurrentOffset)},
-						   "shadow.ptr"
-						   );
+        // Create a builder at the original call instruction
+        // This captures the memory state before any subsequent mutations occur.
+        IRBuilder<> CallBuilder(C);
 
-        // We use the length from the specific call
+        Value *DestPtr = CallBuilder.CreateInBoundsGEP(
+                           ShadowArrTy, ShadowBuf,
+                           {CallBuilder.getInt32(0), CallBuilder.getInt32(CurrentOffset)},
+                           "shadow.ptr"
+                           );
+
         Value *Len = Args.Length;
-        Builder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
+        CallBuilder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
 
-        // Update the tracking offset for the next piece of data
-        if (auto *C = dyn_cast<ConstantInt>(Len)) {
-	  CurrentOffset += C->getZExtValue();
+        if (auto *ConstLen = dyn_cast<ConstantInt>(Len)) {
+          CurrentOffset += ConstLen->getZExtValue();
         }
       }
 
-      // Emit the single merged write
-      Value *TotalLenVal = Builder.getIntN(
-					   FirstArgs.Length->getType()->getIntegerBitWidth(),
-					   TotalConstSize
-					   );
-
-      // Cast shadow.buf to ptr for the write call
-      Value *BufPtr = Builder.CreatePointerCast(ShadowBuf, Builder.getPtrTy());
+      // Emit the single merged write at the very end of the batch
+      IRBuilder<> EndBuilder(Batch.back());
+      Value *TotalLenVal = EndBuilder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), TotalConstSize);
+      Value *BufPtr = EndBuilder.CreatePointerCast(ShadowBuf, EndBuilder.getPtrTy());
 
       std::vector<Value *> NewArgs;
 
       if (FirstArgs.Type == IOArgs::MPI_WRITE_AT) {
-        NewArgs = {
-	  Batch[0]->getArgOperand(0), // fh
-	  Batch[0]->getArgOperand(1), // offset
-	  BufPtr,                     // coalesced stack array
-	  TotalLenVal,                // summed count
-	  Batch[0]->getArgOperand(4), // datatype
-	  Batch[0]->getArgOperand(5)  // status
-        };
+        NewArgs = { Batch[0]->getArgOperand(0), Batch[0]->getArgOperand(1), BufPtr, TotalLenVal, Batch[0]->getArgOperand(4), Batch[0]->getArgOperand(5) };
       } else if (FirstArgs.Type == IOArgs::C_FWRITE) {
-        // fwrite(buf, size, count, FILE*)
-        Value *SizeOne = Builder.getIntN(TotalLenVal->getType()->getIntegerBitWidth(), 1);
+        Value *SizeOne = EndBuilder.getIntN(TotalLenVal->getType()->getIntegerBitWidth(), 1);
         NewArgs = {BufPtr, SizeOne, TotalLenVal, FirstArgs.Target};
       } else if (FirstArgs.Type == IOArgs::POSIX_PWRITE) {
-        // pwrite(fd, buf, count, offset)
         NewArgs = {FirstArgs.Target, BufPtr, TotalLenVal, Batch[0]->getArgOperand(3)};
       } else {
-        // Implicit writes: write(fd, buf, count)
         NewArgs = {FirstArgs.Target, BufPtr, TotalLenVal};
       }
 
-      Builder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
+      MergedCall = EndBuilder.CreateCall(Batch[0]->getCalledFunction(), NewArgs);
       errs() << "[IOOpt] SUCCESS: Shadow Buffered " << Batch.size() << " writes into 1 (" << TotalConstSize << " bytes)!\n";
       break;
     }
