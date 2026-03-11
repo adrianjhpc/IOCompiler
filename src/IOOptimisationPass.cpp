@@ -697,7 +697,6 @@ namespace {
     }
 
     // Inside flushBatch cleanup loop
-    // Inside flushBatch cleanup loop
     for (CallInst *C : Batch) {
       if (!C->use_empty()) {
         IOArgs CArgs = getIOArguments(C);
