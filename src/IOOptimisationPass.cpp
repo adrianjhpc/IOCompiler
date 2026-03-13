@@ -266,7 +266,7 @@ namespace {
     return false;
   }
 
-  bool isSafeToAddToBatch(const SmallVectorImpl<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL, ScalarEvolution &SE, DominatorTree &DT, PostDominatorTree &PDT, bool &ForceShadowBuffer) {
+  bool isSafeToAddToBatch(const SmallVectorImpl<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL, ScalarEvolution &SE, DominatorTree &DT, PostDominatorTree &PDT) {
     if (Batch.empty()) return true;
 
     CallInst *LastCall = Batch.back();
@@ -295,24 +295,11 @@ namespace {
       return MemoryLocation(Buf, LocationSize::beforeOrAfterPointer());
     };
 
-    if (NewArgs.Buffer->getType()->isPointerTy()) {
-        MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
-        for (CallInst *BC : Batch) {
-            IOArgs BArgs = getIOArguments(BC);
-            if (!BArgs.Buffer || !BArgs.Buffer->getType()->isPointerTy()) continue;
-            MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
-            if (isReadBatch && !AA.isNoAlias(NewLoc, BLoc)) {
-                logMessage("[IOOpt-Debug] Batch Break: Memory Aliasing detected between read buffers.");
-                return false;
-            }
-        }
-    }
-
     if (!DT.dominates(LastCall, NewCall)) return false;
 
     if (isReadBatch) {
-        for (Value *Op : NewCall->operands()) {
-            if (auto *Inst = dyn_cast<Instruction>(Op)) {
+        if (NewArgs.Length) {
+            if (auto *Inst = dyn_cast<Instruction>(NewArgs.Length)) {
                 if (!DT.dominates(Inst, Batch.front())) return false;
             }
         }
@@ -369,8 +356,9 @@ namespace {
     BasicBlock *BB2 = NewCall->getParent();
 
     if (BB1 != BB2) {
-      if (isReadBatch) return false;
       if (!PDT.dominates(BB2, BB1)) {
+          if (isReadBatch) return false;
+          
           auto *Term = BB1->getTerminator();
           if (auto *Br = dyn_cast<BranchInst>(Term)) {
               if (!Br->isConditional() || !dependsOn(Br->getCondition(), LastCall)) return false;
@@ -380,9 +368,6 @@ namespace {
       }
     }
     
-    bool isExplicitOffset = (FirstArgs.Type == IOArgs::POSIX_PWRITE || FirstArgs.Type == IOArgs::POSIX_PREAD ||
-                             FirstArgs.Type == IOArgs::MPI_WRITE_AT || FirstArgs.Type == IOArgs::MPI_READ_AT);
-
     LoadInst *Load1 = dyn_cast<LoadInst>(FirstArgs.Target);
 
     auto checkHazard = [&](Instruction *Inst) -> bool {
@@ -391,7 +376,6 @@ namespace {
           if (getIOArguments(CI, Callee).Type != IOArgs::NONE) return true;
           
           if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) {
-              if (!isExplicitOffset && (FirstArgs.Type == IOArgs::POSIX_WRITE || FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::CXX_WRITE)) return true;
               logMessage("[IOOpt-Debug] Batch Break: Opaque function call may interleave I/O or mutate state.");
               return true; 
           }
@@ -399,31 +383,26 @@ namespace {
 
       if (FirstArgs.Type == IOArgs::SPLICE || FirstArgs.Type == IOArgs::SENDFILE) return false;
 
-      if (Inst->mayReadOrWriteMemory() && FirstArgs.Buffer->getType()->isPointerTy()) {
-          MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
-          
-          if (isReadBatch && Inst->mayReadFromMemory()) {
-              for (CallInst *BC : Batch) {
-                  IOArgs BArgs = getIOArguments(BC);
-                  if (!BArgs.Buffer || !BArgs.Buffer->getType()->isPointerTy()) continue;
-                  MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
-                  if (isModOrRefSet(AA.getModRefInfo(Inst, BLoc))) {
-                      logMessage("[IOOpt-Debug] Batch Break: Read-After-Write dependency on I/O buffer.");
-                      return true; 
+      if (Inst->mayReadOrWriteMemory()) {
+          if (isReadBatch) {
+              if (NewArgs.Buffer->getType()->isPointerTy()) {
+                  MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
+                  if (isModOrRefSet(AA.getModRefInfo(Inst, NewLoc))) {
+                      logMessage("[IOOpt-Debug] Batch Break: RAW/WAW dependency on new read buffer.");
+                      return true;
                   }
               }
-          }
-
-          if (isModSet(AA.getModRefInfo(Inst, NewLoc))) {
-              ForceShadowBuffer = true;
-          }
-
-          for (CallInst *BatchedCall : Batch) {
-              IOArgs BArgs = getIOArguments(BatchedCall);
-              if (!BArgs.Buffer || !BArgs.Buffer->getType()->isPointerTy()) continue;
-              MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
-              if (isModSet(AA.getModRefInfo(Inst, BLoc))) {
-                  ForceShadowBuffer = true; 
+          } else {
+              if (Inst->mayWriteToMemory()) {
+                  for (CallInst *BC : Batch) {
+                      IOArgs BArgs = getIOArguments(BC);
+                      if (!BArgs.Buffer || !BArgs.Buffer->getType()->isPointerTy()) continue;
+                      MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
+                      if (isModSet(AA.getModRefInfo(Inst, BLoc))) {
+                          logMessage("[IOOpt-Debug] Batch Break: WAR dependency on batched write buffer.");
+                          return true; 
+                      }
+                  }
               }
           }
 
@@ -477,35 +456,64 @@ namespace {
   enum class IOPattern { Contiguous, Strided, ShadowBuffer, DynamicShadowBuffer, Vectored, Unprofitable };
 
   IOPattern classifyBatch(const SmallVectorImpl<CallInst*> &Batch, const DataLayout &DL, 
-                          uint64_t &OutTotalRange, ScalarEvolution *SE, bool ForceShadowBuffer) {
+                          uint64_t &OutTotalRange, ScalarEvolution *SE) {
     if (Batch.size() < 2) return IOPattern::Unprofitable;
 
     IOArgs FirstArgs = getIOArguments(Batch.front());
+    bool isReadBatch = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD || FirstArgs.Type == IOArgs::POSIX_PREAD || FirstArgs.Type == IOArgs::CXX_READ);
     
     if (FirstArgs.Type == IOArgs::SPLICE || FirstArgs.Type == IOArgs::SENDFILE) return IOPattern::Contiguous; 
 
-    if (!ForceShadowBuffer) {
-        bool StrictPhysical = true;
-        for (size_t i = 0; i < Batch.size() - 1; ++i) {
-          if (!checkAdjacency(getIOArguments(Batch[i]).Buffer, getIOArguments(Batch[i]).Length, 
-                              getIOArguments(Batch[i+1]).Buffer, DL, SE, false)) {
-            StrictPhysical = false;
-            break;
-          }
+    bool StrictPhysical = true;
+    for (size_t i = 0; i < Batch.size() - 1; ++i) {
+      if (!checkAdjacency(getIOArguments(Batch[i]).Buffer, getIOArguments(Batch[i]).Length, 
+                          getIOArguments(Batch[i+1]).Buffer, DL, SE, false)) {
+        StrictPhysical = false;
+        break;
+      }
+    }
+    if (StrictPhysical) return IOPattern::Contiguous;
+    
+    bool isWriteBatch = (FirstArgs.Type == IOArgs::POSIX_WRITE || FirstArgs.Type == IOArgs::POSIX_PWRITE || 
+                         FirstArgs.Type == IOArgs::MPI_WRITE_AT || FirstArgs.Type == IOArgs::C_FWRITE || 
+                         FirstArgs.Type == IOArgs::CXX_WRITE);
+
+    if (isWriteBatch) {
+        bool isConstantTinySize = true;
+        uint64_t ElemSize = 0;
+        if (auto *CSize = dyn_cast_or_null<ConstantInt>(FirstArgs.Length)) {
+            ElemSize = CSize->getZExtValue();
+            if (ElemSize != 1 && ElemSize != 2 && ElemSize != 4 && ElemSize != 8) {
+                isConstantTinySize = false;
+            } else {
+                for (CallInst *C : Batch) {
+                    auto *CS = dyn_cast_or_null<ConstantInt>(getIOArguments(C).Length);
+                    if (!CS || CS->getZExtValue() != ElemSize) {
+                        isConstantTinySize = false;
+                        break;
+                    }
+                }
+            }
+        } else {
+            isConstantTinySize = false;
         }
-        if (StrictPhysical) return IOPattern::Contiguous;
-        
-        if (Batch.size() >= Config.BatchThreshold) {
-          if (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::POSIX_WRITE || 
-              FirstArgs.Type == IOArgs::POSIX_PREAD || FirstArgs.Type == IOArgs::POSIX_PWRITE) {
-            return IOPattern::Vectored;
-          }
+
+        if (isConstantTinySize && Batch.size() >= 2 && Batch.size() <= 64) {
+            OutTotalRange = ElemSize; 
+            return IOPattern::Strided;
         }
     }
+    
+    // Reads are high latency; convert even 2 reads to readv.
+    // Writes are buffered; require Config.BatchThreshold for writev.
+    if (isReadBatch || Batch.size() >= Config.BatchThreshold) {
+      if (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::POSIX_WRITE || 
+          FirstArgs.Type == IOArgs::POSIX_PREAD || FirstArgs.Type == IOArgs::POSIX_PWRITE) {
+        return IOPattern::Vectored;
+      }
+    }
 
-    if (FirstArgs.Type == IOArgs::POSIX_WRITE || FirstArgs.Type == IOArgs::POSIX_PWRITE || 
-        FirstArgs.Type == IOArgs::MPI_WRITE_AT || FirstArgs.Type == IOArgs::C_FWRITE || FirstArgs.Type == IOArgs::CXX_WRITE) { 
-        
+    if (isWriteBatch) { 
       uint64_t TotalConstSize = 0;
       bool AllSizesConstant = true;
         
@@ -519,27 +527,26 @@ namespace {
         }
       }
         
-      // Static buffers are always profitable for N>=2
       if (AllSizesConstant && TotalConstSize > 0 && TotalConstSize <= Config.ShadowBufferSize) {
         OutTotalRange = TotalConstSize;
         return IOPattern::ShadowBuffer;
       }
       
       if (Batch.size() >= Config.BatchThreshold) {
-          if (!ForceShadowBuffer) return IOPattern::DynamicShadowBuffer;
+          return IOPattern::DynamicShadowBuffer;
       }
     }
 
     return IOPattern::Unprofitable;
   }
 
-  bool flushBatch(SmallVectorImpl<CallInst*> &Batch, Module *M, ScalarEvolution &SE, bool ForceShadowBuffer) {
+  bool flushBatch(SmallVectorImpl<CallInst*> &Batch, Module *M, ScalarEvolution &SE) {
     if (Batch.empty()) return false;
 
     const DataLayout &DL = M->getDataLayout();
     uint64_t TotalConstSize = 0;
     
-    IOPattern Pattern = classifyBatch(Batch, DL, TotalConstSize, &SE, ForceShadowBuffer);
+    IOPattern Pattern = classifyBatch(Batch, DL, TotalConstSize, &SE);
 
     if (Pattern == IOPattern::Unprofitable) {
       Batch.clear();
@@ -607,7 +614,11 @@ namespace {
       Value *GatherVec = PoisonValue::get(VecTy);
       for (unsigned i = 0; i < NumElements; ++i) {
         IOArgs Args = getIOArguments(Batch[i]);
-        LoadInst *LoadedVal = InsertBuilder.CreateLoad(ElementTy, Args.Buffer, "strided.load");
+        Value *SafeBufPtr = Args.Buffer;
+        if (SafeBufPtr->getType() != InsertBuilder.getPtrTy() && SafeBufPtr->getType()->isPointerTy()) {
+            SafeBufPtr = InsertBuilder.CreatePointerBitCastOrAddrSpaceCast(SafeBufPtr, InsertBuilder.getPtrTy());
+        }
+        LoadInst *LoadedVal = InsertBuilder.CreateLoad(ElementTy, SafeBufPtr, "strided.load");
         GatherVec = InsertBuilder.CreateInsertElement(GatherVec, LoadedVal, InsertBuilder.getInt32(i), "gather.insert");
       }
       Function *F = Batch.back()->getFunction();
@@ -924,15 +935,13 @@ namespace {
       
       std::unordered_map<Value*, SmallVector<CallInst*, 8>> ActiveBatches;
       std::unordered_map<Value*, uint64_t> ActiveBatchBytes;
-      std::unordered_map<Value*, bool> ForceShadowBufMap;
 
       auto flushAllBatches = [&]() {
           for (auto &Pair : ActiveBatches) {
-              if (flushBatch(Pair.second, F.getParent(), SE, ForceShadowBufMap[Pair.first])) Changed = true;
+              if (flushBatch(Pair.second, F.getParent(), SE)) Changed = true;
           }
           ActiveBatches.clear();
           ActiveBatchBytes.clear();
-          ForceShadowBufMap.clear();
       };
 
       for (BasicBlock &BB : F) {
@@ -948,9 +957,8 @@ namespace {
                     Value *SyncTarget = Call->getArgOperand(0);
                     Value *BaseFD = getBaseFD(SyncTarget);
                     if (ActiveBatches.count(BaseFD) && !ActiveBatches[BaseFD].empty()) {
-                        if (flushBatch(ActiveBatches[BaseFD], F.getParent(), SE, ForceShadowBufMap[BaseFD])) Changed = true;
+                        if (flushBatch(ActiveBatches[BaseFD], F.getParent(), SE)) Changed = true;
                         ActiveBatchBytes[BaseFD] = 0;
-                        ForceShadowBufMap[BaseFD] = false;
                     }
                 }
                 continue; 
@@ -984,26 +992,23 @@ namespace {
                 IOArgs BatchArgs = getIOArguments(Batch.front());
                 bool BatchIsRead = (BatchArgs.Type == IOArgs::POSIX_READ || BatchArgs.Type == IOArgs::C_FREAD || BatchArgs.Type == IOArgs::POSIX_PREAD || BatchArgs.Type == IOArgs::MPI_READ_AT || BatchArgs.Type == IOArgs::CXX_READ);
                 if (BatchIsRead != isRead) {
-                  if (flushBatch(Batch, F.getParent(), SE, ForceShadowBufMap[BaseFD])) Changed = true;
+                  if (flushBatch(Batch, F.getParent(), SE)) Changed = true;
                   ActiveBatchBytes[BaseFD] = 0;
-                  ForceShadowBufMap[BaseFD] = false; 
                 }
               }
 
-              if (isSafeToAddToBatch(Batch, Call, AA, DL, SE, DT, PDT, ForceShadowBufMap[BaseFD])) {
+              if (isSafeToAddToBatch(Batch, Call, AA, DL, SE, DT, PDT)) {
                 Batch.push_back(Call);
                 ActiveBatchBytes[BaseFD] += CallBytes;
 
                 if (ActiveBatchBytes[BaseFD] >= Config.HighWaterMark) {
-                  if (flushBatch(Batch, F.getParent(), SE, ForceShadowBufMap[BaseFD])) Changed = true;
+                  if (flushBatch(Batch, F.getParent(), SE)) Changed = true;
                   ActiveBatchBytes[BaseFD] = 0;
-                  ForceShadowBufMap[BaseFD] = false; 
                 }
               } else {
-                if (flushBatch(Batch, F.getParent(), SE, ForceShadowBufMap[BaseFD])) Changed = true;
+                if (flushBatch(Batch, F.getParent(), SE)) Changed = true;
                 Batch.push_back(Call);
                 ActiveBatchBytes[BaseFD] = CallBytes; 
-                ForceShadowBufMap[BaseFD] = false; 
               }
             }
           }

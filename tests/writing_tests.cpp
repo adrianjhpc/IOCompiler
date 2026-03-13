@@ -21,11 +21,13 @@ NOINLINE void test_non_contiguous_write(int fd) {
     char buf2[50] = {0};
     char buf3[50] = {0};
 
-    // CHECK: %iovec.array.N = alloca [3 x { ptr, i64 }]
-    // CHECK: call {{.*}} @writev(i32 {{.*}}, ptr %iovec.array.N, i32 3)
-    
-    // 3 writes * 50 bytes = 150 bytes total. 
-    // 150 > 128, so the Dynamic Cost Model threshold drops to 3 and vectorizes
+    // 3 writes * 50 bytes = 150 bytes total.
+    // 150 is less than the default 4096-byte Shadow Buffer limit.
+    // The pass will correctly allocate a 150-byte stack buffer and use a single write().
+
+    // CHECK: %shadow.buf = alloca [150 x i8], align 4096
+    // CHECK: call {{.*}} @write(i32 {{.*}}, ptr %shadow.buf, i64 150)
+
     write(fd, buf1, 50);
     write(fd, buf2, 50);
     write(fd, buf3, 50);

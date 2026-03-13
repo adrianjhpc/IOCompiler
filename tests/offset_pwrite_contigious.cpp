@@ -15,7 +15,7 @@ void test_pwrite_contiguous(int fd, const char* b1, const char* b2, const char* 
     // SCEV should prove this and emit a single 4-element pwritev.
 
     // CHECK: call {{.*}} @pwritev(i32 {{.*}}, ptr {{.*}}, i32 4, i64 {{.*}})
-    
+
     // CRITICAL FIX: Add the open parenthesis so we don't accidentally match "pwritev"
     // CHECK-NOT: call {{.*}} @pwrite(
 
@@ -33,21 +33,21 @@ __attribute__((noinline))
 void test_pwrite_gap(int fd, const char* b1, const char* b2, const char* b3, const char* b4, off_t base_offset) {
 
     // VERIFICATION:
-    // The second write starts at `base_offset + 15` (a 5-byte gap).
-    // The pass MUST NOT merge these.
+    // We introduce a gap between EVERY write.
+    // The pass MUST NOT merge any of these.
 
     // CHECK-NOT: call {{.*}} @pwritev
 
-    // We expect 4 separate pwrite calls because of the gaps. 
+    // We expect 4 separate pwrite calls because of the gaps.
     // We use wildcards to ignore 'noundef' and register names.
-    
+
     // CHECK: call {{.*}} @pwrite(i32 {{.*}}, ptr {{.*}}, i64 {{.*}}10, i64 {{.*}})
     // CHECK: call {{.*}} @pwrite(i32 {{.*}}, ptr {{.*}}, i64 {{.*}}20, i64 {{.*}})
     // CHECK: call {{.*}} @pwrite(i32 {{.*}}, ptr {{.*}}, i64 {{.*}}30, i64 {{.*}})
     // CHECK: call {{.*}} @pwrite(i32 {{.*}}, ptr {{.*}}, i64 {{.*}}40, i64 {{.*}})
 
     pwrite(fd, b1, 10, base_offset);
-    pwrite(fd, b2, 20, base_offset + 15); // THE GAP HAZARD
-    pwrite(fd, b3, 30, base_offset + 35);
-    pwrite(fd, b4, 40, base_offset + 65);
+    pwrite(fd, b2, 20, base_offset + 15); // GAP 1: 10 -> 15
+    pwrite(fd, b3, 30, base_offset + 40); // GAP 2: 15+20=35 -> 40
+    pwrite(fd, b4, 40, base_offset + 75); // GAP 3: 40+30=70 -> 75
 }
