@@ -16,9 +16,11 @@
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h" 
 #include "llvm/Transforms/Utils/LCSSA.h"        
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/LoopVersioning.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/Transforms/IPO/FunctionAttrs.h"
@@ -479,7 +481,6 @@ namespace {
     if (Batch.size() < 2) return IOPattern::Unprofitable;
 
     IOArgs FirstArgs = getIOArguments(Batch.front());
-    bool isReadBatch = (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::C_FREAD || FirstArgs.Type == IOArgs::POSIX_PREAD || FirstArgs.Type == IOArgs::CXX_READ);
     
     if (FirstArgs.Type == IOArgs::SPLICE || FirstArgs.Type == IOArgs::SENDFILE) return IOPattern::Contiguous; 
 
@@ -494,7 +495,7 @@ namespace {
         }
         if (StrictPhysical) return IOPattern::Contiguous;
         
-        if (Batch.size() >= 2) {
+        if (Batch.size() >= Config.BatchThreshold) {
           if (FirstArgs.Type == IOArgs::POSIX_READ || FirstArgs.Type == IOArgs::POSIX_WRITE || 
               FirstArgs.Type == IOArgs::POSIX_PREAD || FirstArgs.Type == IOArgs::POSIX_PWRITE) {
             return IOPattern::Vectored;
@@ -518,12 +519,13 @@ namespace {
         }
       }
         
+      // Static buffers are always profitable for N>=2
       if (AllSizesConstant && TotalConstSize > 0 && TotalConstSize <= Config.ShadowBufferSize) {
         OutTotalRange = TotalConstSize;
         return IOPattern::ShadowBuffer;
       }
       
-      if (Batch.size() >= 2) {
+      if (Batch.size() >= Config.BatchThreshold) {
           if (!ForceShadowBuffer) return IOPattern::DynamicShadowBuffer;
       }
     }
@@ -783,9 +785,7 @@ namespace {
       BasicBlock *ExitBB = L->getExitBlock();
       if (!Preheader || !ExitBB) return false;
 
-      // RELAXED LCSSA: Removes reliance on strict test-suite pass pipelines.
-      if (!L->isLoopSimplifyForm()) {
-          logMessage("[IOOpt-Debug] Loop Hoist Blocked: Loop is not in Simplify form.");
+      if (!L->isLoopSimplifyForm() || !L->isLCSSAForm(DT)) {
           return false;
       }
 
@@ -917,7 +917,6 @@ namespace {
       DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
       PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
 
-      // LOOP HOIST LAA DEPENDENCY REMOVED ENTIRELY
       auto PreorderLoops = LI.getLoopsInPreorder();
       for (Loop *L : PreorderLoops) {
         if (optimiseLoopIO(L, SE, DL, LI, DT, AA)) Changed = true;
