@@ -1,4 +1,4 @@
-i//===- IOLoopBatching.cpp - MLIR High-Level I/O Optimizer -----------------===//
+//===- IOLoopBatching.cpp - MLIR High-Level I/O Optimizer -----------------===//
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -7,7 +7,7 @@ i//===- IOLoopBatching.cpp - MLIR High-Level I/O Optimizer -----------------===/
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Pass/Pass.h"
-#include "IODialect.h" // Generated from the .td file above
+#include "IODialect.h"
 
 using namespace mlir;
 
@@ -16,7 +16,6 @@ namespace {
 /// PASS 1: Loop I/O Pattern Recognition
 /// Transforms loops with repeated I/O operations into batched operations.
 /// 
-/// Matches your exact scenario:
 /// Before: scf.for %i = %zero to %ten { io.write(%fd, %buffer, %one) }
 /// After:  io.batch_write(%fd, %buffer, %ten)
 struct HoistIOLoopPattern : public OpRewritePattern<scf::ForOp> {
@@ -70,7 +69,7 @@ struct HoistIOLoopPattern : public OpRewritePattern<scf::ForOp> {
         totalSize
     );
 
-    // Completely erase the original loop!
+    // Completely erase the original loop
     rewriter.eraseOp(loop);
 
     return success();

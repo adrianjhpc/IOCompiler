@@ -35,7 +35,7 @@ struct BatchWriteLowering : public ConvertOpToLLVMPattern<io::BatchWriteOp> {
     auto memrefType = op.getBuffer().getType().cast<MemRefType>();
     Value rawPtr = getStridedElementPtr(op.getLoc(), memrefType, adaptor.getBuffer(), {}, rewriter);
 
-    // Emit the actual LLVM IR Call instruction!
+    // Emit the actual LLVM IR Call instruction
     auto llvmCall = rewriter.create<LLVM::CallOp>(
         op.getLoc(), 
         writeFunc, 
