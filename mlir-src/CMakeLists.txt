@@ -33,3 +33,10 @@ target_link_libraries(MLIRIOOptimiser PRIVATE
   MLIRLLVMDialect
   MLIRLLVMCommonConversion
 )
+
+# Tell the compiler exactly where to look for headers and generated .inc files
+target_include_directories(MLIRIOOptimiser PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}             # For IODialect.h in mlir-src/
+    ${CMAKE_CURRENT_BINARY_DIR}             # For the generated .inc files
+    ${CMAKE_BINARY_DIR}                     # Fallback for global generated files
+)
