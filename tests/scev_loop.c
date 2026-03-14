@@ -1,4 +1,4 @@
-// RUN: %clang -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o - | %opt -load-pass-plugin=%S/../build/src/libIOOpt.so -passes="mem2reg,instcombine,loop-simplify,loop-rotate,indvars,io-opt" -S | %FileCheck %s
+// RUN: %clang -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o - | %opt -load-pass-plugin=%shlibdir/libIOOpt%shlibext -passes="mem2reg,instcombine,loop-simplify,loop-rotate,indvars,io-opt" -S | %FileCheck %s
 
 #include <unistd.h>
 

@@ -7,6 +7,23 @@ find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
+# Find MLIR
+find_package(MLIR REQUIRED CONFIG)
+
+message(STATUS "Found MLIR ${MLIR_PACKAGE_VERSION}")
+message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
+
+# Add LLVM and MLIR CMake paths so we can use their custom macros (like TableGen)
+list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
+
+include(TableGen)
+include(AddLLVM)
+include(AddMLIR)
+
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
+
 # ------------------------------------------------------------------------------
 # Test Suite Integration (lit)
 # ------------------------------------------------------------------------------
@@ -62,5 +79,5 @@ endif()
 
 find_package(MPI)
 
-add_subdirectory(src)
+add_subdirectory(llvm-src)
 add_subdirectory(benchmarks)

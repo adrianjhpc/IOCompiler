@@ -1,7 +1,7 @@
 import os
 
 # Paths injected by CMake
-config.shlibdir = "@IO_BINARY_DIR@/src"
+config.shlibdir = "@IO_BINARY_DIR@/llvm-src"
 config.shlibext = "@IO_SHLIB_EXT@"
 config.io_source_root = "@IO_SOURCE_DIR@"
 

@@ -51,7 +51,7 @@ bool verify_output() {
             // Recalculate the expected color mathematically
             char expected_r = (pixel_count % 255);
             char expected_g = ((pixel_count / WIDTH) % 255);
-            char expected_b = 128;
+            uint8_t expected_b = 128;
 
             int buf_idx = x * 3;
             if (row_buffer[buf_idx] != expected_r || 
@@ -94,7 +94,7 @@ int main() {
     
     auto start = std::chrono::high_resolution_clock::now();
 
-    char pixel[3];
+    uint8_t pixel[3];
     
     for (int i = 0; i < TOTAL_PIXELS; i++) {
         pixel[0] = (i % 255);           // Red
