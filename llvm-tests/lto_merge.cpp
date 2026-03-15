@@ -9,7 +9,7 @@
 
 // RUN: %llvmlink %t.main.bc %t.logger.bc -o %t.merged.bc
 
-// RUN: %opt -load-pass-plugin=%shlibdir/libIOOpt%shlibext -passes="default<O3>,function(io-opt)" %t.merged.bc -disable-output 2>&1 | %FileCheck %s
+// RUN: %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes="default<O3>,function(io-opt)" %t.merged.bc -disable-output 2>&1 | %FileCheck %s
 #include <unistd.h>
 #include <string.h>
 

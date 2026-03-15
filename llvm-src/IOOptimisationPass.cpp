@@ -28,6 +28,18 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h" 
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Config/abi-breaking.h"
+
+// Clang and LLD do not export these symbols dynamically like 'opt' does.
+// By defining them here, we satisfy the dynamic loader so our plugin 
+// can be loaded during the Link-Time Optimization phase.
+namespace llvm {
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+  int EnableABIBreakingChecks = 1;
+#else
+  int DisableABIBreakingChecks = 1;
+#endif
+}
 
 #include <cstdlib>
 #include <string>
@@ -212,14 +224,26 @@ namespace {
           }
           
           if (TargetToInline) {
+              // Grab the caller and callee before we destroy the call instruction via inlining
+              Function *Caller = TargetToInline->getFunction();
+              Function *Callee = TargetToInline->getCalledFunction();
+              
+              std::string CallerName = Caller ? llvm::demangle(Caller->getName().str()) : "unknown";
+              std::string CalleeName = Callee ? llvm::demangle(Callee->getName().str()) : "unknown";
+
               InlineFunctionInfo IFI;
               if (InlineFunction(*TargetToInline, IFI).isSuccess()) {
                   LocalChanged = true;
                   Changed = true;
                   NumIPAInlines++;
-                  logMessage("[IOOpt] SUCCESS: Inter-Procedural I/O chain merged by inlining wrapper function.");
+                  
+                  // This will specifically document when an I/O function from one file 
+                  // is merged into a calling function from another file during LTO
+                  logMessage("[IOOpt-LTO] SUCCESS: Inlined I/O wrapper '" + 
+                             Twine(CalleeName) + "' into '" + Twine(CallerName) + "'.");
               }
           }
+
           
       } while (LocalChanged);
       
@@ -1026,33 +1050,60 @@ llvmGetPassPluginInfo() {
   return {
     LLVM_PLUGIN_API_VERSION, "IOOpt", LLVM_VERSION_STRING,
     [](PassBuilder &PB) {
+        
+      // Command-line parsing for Function-level 'opt -passes=io-opt'
       PB.registerPipelineParsingCallback(
-                     [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
-                       if (Name == "io-opt") {
-                         FPM.addPass(IOOptimisationPass()); 
-                         return true;
-                       }
-                       return false;
-                     });
+          [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
+            if (Name == "io-opt") {
+              FPM.addPass(IOOptimisationPass()); 
+              return true;
+            }
+            return false;
+          });
+
+      // Command-line parsing for our Python Harness 'opt -passes=io-lto-merge'
+      PB.registerPipelineParsingCallback(
+          [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
+            if (Name == "io-lto-merge") {
+              // First, inline cross-file I/O wrappers now that files are merged
+              MPM.addPass(InterProceduralIOBatchingPass());
+              // Then, run the actual batching/vectoring passes
+              FunctionPassManager FPM;
+              FPM.addPass(LoopSimplifyPass());
+              FPM.addPass(LCSSAPass());
+              FPM.addPass(IOOptimisationPass());
+              MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM))); 
+              return true;
+            }
+            return false;
+          });
+
+      // Keep our early pipeline start callback
       PB.registerPipelineStartEPCallback(
-                     [](ModulePassManager &MPM, OptimizationLevel Level) {
-                       MPM.addPass(InterProceduralIOBatchingPass());
-                     });
+          [](ModulePassManager &MPM, OptimizationLevel Level) {
+            MPM.addPass(InterProceduralIOBatchingPass());
+          });
+
+      // Standard Compile-Time Optimization
       PB.registerOptimizerLastEPCallback(
-                     [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
-                       FunctionPassManager FPM;
-                       FPM.addPass(LoopSimplifyPass());
-                       FPM.addPass(LCSSAPass());
-                       FPM.addPass(IOOptimisationPass());
-                       MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM))); 
-                     });
+          [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+            FunctionPassManager FPM;
+            FPM.addPass(LoopSimplifyPass());
+            FPM.addPass(LCSSAPass());
+            FPM.addPass(IOOptimisationPass());
+            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM))); 
+          });
+
+      // Standard Clang LTO Callback (-flto)
       PB.registerFullLinkTimeOptimizationLastEPCallback(
-                            [](ModulePassManager &MPM, OptimizationLevel Level) {
-                               FunctionPassManager FPM;
-                               FPM.addPass(LoopSimplifyPass());
-                               FPM.addPass(LCSSAPass());
-                               FPM.addPass(IOOptimisationPass());
-                               MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM))); 
-                            });
+          [](ModulePassManager &MPM, OptimizationLevel Level) {
+            // Added Interprocedural pass here to catch cross-file I/O wrappers!
+            MPM.addPass(InterProceduralIOBatchingPass());
+            FunctionPassManager FPM;
+            FPM.addPass(LoopSimplifyPass());
+            FPM.addPass(LCSSAPass());
+            FPM.addPass(IOOptimisationPass());
+            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM))); 
+          });
     }};
 }

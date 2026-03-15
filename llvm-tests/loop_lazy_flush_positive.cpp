@@ -1,4 +1,4 @@
-// RUN: %ppclang -O1 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/libIOOpt%shlibext -passes="loop-simplify,lcssa,io-opt" -S | %FileCheck %s
+// RUN: %ppclang -O1 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes="loop-simplify,lcssa,io-opt" -S | %FileCheck %s
 
 #include <unistd.h>
 

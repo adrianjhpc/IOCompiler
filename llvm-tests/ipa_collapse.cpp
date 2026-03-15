@@ -1,4 +1,4 @@
-// RUN: %clang -O3 -flto=full -emit-llvm -S %s -o - | %opt -load-pass-plugin=%shlibdir/libIOOpt%shlibext -passes=io-opt -S | %FileCheck %s
+// RUN: %clang -O3 -flto=full -emit-llvm -S %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -S | %FileCheck %s
 
 #include <stdio.h>
 

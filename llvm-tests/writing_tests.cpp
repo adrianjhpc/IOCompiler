@@ -1,4 +1,4 @@
-// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/libIOOpt%shlibext -passes=io-opt -S | %FileCheck %s
+// RUN: %ppclang -O2 -fno-inline -emit-llvm -S -c %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -S | %FileCheck %s
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -10,7 +10,7 @@
 NOINLINE void test_contiguous_write(int fd) {
     char buffer[10] = "012345678";
     // We relax the regex to ignore 'noundef' and other attributes
-    // CHECK: call {{.*}} @write(i32 {{.*}}%0, ptr {{.*}}, i64 4)
+    // CHECK: call {{.*}} @write(i32 %fd, ptr {{.*}}, i64 4)
     write(fd, &buffer[0], 2);
     write(fd, &buffer[2], 2);
 }
@@ -27,7 +27,6 @@ NOINLINE void test_non_contiguous_write(int fd) {
 
     // CHECK: %shadow.buf = alloca [150 x i8], align 4096
     // CHECK: call {{.*}} @write(i32 {{.*}}, ptr %shadow.buf, i64 150)
-
     write(fd, buf1, 50);
     write(fd, buf2, 50);
     write(fd, buf3, 50);

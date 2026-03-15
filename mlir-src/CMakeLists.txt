@@ -1,9 +1,14 @@
-include_directories(${MLIR_INCLUDE_DIRS})
-
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti -fno-exceptions")
 
 # Run TableGen to generate Dialect C++ code from IODialect.td
 set(LLVM_TARGET_DEFINITIONS ${CMAKE_CURRENT_SOURCE_DIR}/IODialect.td)
+
+include_directories(
+  ${MLIR_INCLUDE_DIRS}
+  ${CLANG_IR_SRC_DIR}/include
+  ${CLANG_IR_BUILD_DIR}/tools/clang/include
+  ${CLANG_IR_BUILD_DIR}/tools/clang/include/clang/CIR/Interfaces  # This is usually where the .inc lives
+)
 
 mlir_tablegen(IODialect.h.inc -gen-op-decls)
 mlir_tablegen(IODialect.cpp.inc -gen-op-defs)

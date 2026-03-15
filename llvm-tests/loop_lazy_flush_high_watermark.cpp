@@ -1,5 +1,5 @@
 // RUN: %ppclang -O1 -fno-inline -emit-llvm -S -c %s -o - | \
-// RUN: env IO_HIGH_WATER_MARK=32768 %opt -load-pass-plugin=%shlibdir/libIOOpt%shlibext -passes=io-opt -S | \
+// RUN: env IO_HIGH_WATER_MARK=32768 %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes=io-opt -S | \
 // RUN: %FileCheck %s
 #include <unistd.h>
 

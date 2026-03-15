@@ -1,5 +1,4 @@
-// RUN: %ppclang -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o - | %opt -load-pass-plugin=%shlibdir/libIOOpt%shlibext -passes="mem2reg,instcombine,io-opt" -S | %FileCheck %s
-
+// RUN: %ppclang -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o - | %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes="mem2reg,instcombine,io-opt" -S | %FileCheck %s
 #include <iostream>
 
 // CHECK-LABEL: @_Z14test_cxx_writev
