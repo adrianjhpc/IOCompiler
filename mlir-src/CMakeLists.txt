@@ -7,7 +7,56 @@ include_directories(
   ${MLIR_INCLUDE_DIRS}
   ${CLANG_IR_SRC_DIR}/include
   ${CLANG_IR_BUILD_DIR}/tools/clang/include
-  ${CLANG_IR_BUILD_DIR}/tools/clang/include/clang/CIR/Interfaces  # This is usually where the .inc lives
+  ${CLANG_IR_BUILD_DIR}/tools/clang/include/clang/CIR/Interfaces  
+)
+
+
+find_library(MLIRCIR_LIB 
+    NAMES MLIRCIR 
+    PATHS ${LLVM_LIBRARY_DIR} 
+    NO_DEFAULT_PATH
+)
+
+find_library(MLIRCIR_INTERFACES_LIB 
+    NAMES MLIRCIRInterfaces 
+    PATHS ${LLVM_LIBRARY_DIR} 
+    NO_DEFAULT_PATH
+)
+
+if(NOT MLIRCIR_LIB OR NOT MLIRCIR_INTERFACES_LIB)
+    message(FATAL_ERROR "Could not find ClangIR libraries in ${LLVM_LIBRARY_DIR}!")
+endif()
+
+find_library(CLANGAST_LIB 
+    NAMES clangAST 
+    PATHS ${LLVM_LIBRARY_DIR} 
+    NO_DEFAULT_PATH
+)
+
+find_library(CLANGLEX_LIB 
+    NAMES clangLex 
+    PATHS ${LLVM_LIBRARY_DIR} 
+    NO_DEFAULT_PATH
+)
+
+find_library(CLANGBASIC_LIB 
+    NAMES clangBasic 
+    PATHS ${LLVM_LIBRARY_DIR} 
+    NO_DEFAULT_PATH
+)
+
+if(NOT CLANGAST_LIB OR NOT CLANGLEX_LIB OR NOT CLANGBASIC_LIB)
+    message(FATAL_ERROR "Could not find Clang AST/Lex/Basic libraries in ${LLVM_LIBRARY_DIR}!")
+endif()
+
+llvm_map_components_to_libnames(LLVM_CORE_DEPS
+    FrontendOpenMP
+    FrontendHLSL
+    Analysis
+    TransformUtils
+    Target
+    Core
+    Support
 )
 
 mlir_tablegen(IODialect.h.inc -gen-op-decls)
@@ -40,6 +89,12 @@ target_link_libraries(MLIRIOOptimiser PRIVATE
   MLIRFuncDialect
   MLIRLLVMDialect
   MLIRLLVMCommonConversion
+  ${MLIRCIR_LIB}
+  ${MLIRCIR_INTERFACES_LIB}
+  ${CLANGAST_LIB}
+  ${CLANGLEX_LIB}
+  ${CLANGBASIC_LIB}
+  ${LLVM_CORE_DEPS}
 )
 
 # Tell the compiler where to look for headers and generated .inc files
@@ -64,4 +119,10 @@ target_link_libraries(io-opt PRIVATE
   MLIRFuncDialect
   MLIRLLVMDialect
   MLIRSCFDialect
+  ${MLIRCIR_LIB}
+  ${MLIRCIR_INTERFACES_LIB}
+  ${CLANGAST_LIB}
+  ${CLANGLEX_LIB}
+  ${CLANGBASIC_LIB}
+  ${LLVM_CORE_DEPS}
 )

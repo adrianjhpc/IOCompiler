@@ -152,13 +152,12 @@ struct CirLoopBatchingPattern : public OpInterfaceRewritePattern<cir::LoopOpInte
   using OpInterfaceRewritePattern<cir::LoopOpInterface>::OpInterfaceRewritePattern;
 
   LogicalResult matchAndRewrite(cir::LoopOpInterface loopInterface, PatternRewriter &rewriter) const override {
-    // Safely extract the underlying ClangIR operation
     Operation *op = loopInterface.getOperation();
     
     Region *bodyRegion = nullptr;
     Region *condRegion = nullptr;
 
-    // Cast to the concrete loop types to bypass the barebones interface
+    // Safely cast to the concrete loop types
     if (auto forOp = dyn_cast<cir::ForOp>(op)) {
       bodyRegion = &forOp.getBody();
       condRegion = &forOp.getCond();
@@ -166,13 +165,12 @@ struct CirLoopBatchingPattern : public OpInterfaceRewritePattern<cir::LoopOpInte
       bodyRegion = &whileOp.getBody();
       condRegion = &whileOp.getCond();
     } else {
-      return failure(); // Unrecognized CIR loop type
+      return failure(); 
     }
 
     if (!bodyRegion || bodyRegion->empty()) return failure();
 
     cir::CallOp writeCall = nullptr;
-    // Walk the body to find a 'write' call
     bodyRegion->walk([&](cir::CallOp call) {
       auto callee = call.getCallee();
       if (callee && callee->starts_with("write")) {
@@ -198,62 +196,48 @@ struct CirLoopBatchingPattern : public OpInterfaceRewritePattern<cir::LoopOpInte
     if (tripCount <= 1) return failure();
 
     Location loc = op->getLoc();
-    auto ctx = rewriter.getContext();
-
-    // Use the Operation* (op) for the insertion point
+    
     rewriter.setInsertionPoint(op); 
 
-    auto i32Ty = rewriter.getI32Type();
-    auto i64Ty = rewriter.getI64Type();
-    auto ptrTy = cir::PointerType::get(ctx, rewriter.getI8Type());
-    auto alignAttr = rewriter.getI64IntegerAttr(16); // Strict ClangIR alignment
-
-    // Allocate space for the pointers and sizes
-    auto ptrArrayTy = cir::ArrayType::get(ctx, ptrTy, tripCount);
-    auto sizeArrayTy = cir::ArrayType::get(ctx, i64Ty, tripCount);
-
-    Value iovPtrs = rewriter.create<cir::AllocaOp>(
-        loc, cir::PointerType::get(ctx, ptrArrayTy), ptrArrayTy, "iov_ptrs", alignAttr);
-    Value iovSizes = rewriter.create<cir::AllocaOp>(
-        loc, cir::PointerType::get(ctx, sizeArrayTy), sizeArrayTy, "iov_sizes", alignAttr);
-
-    // Track index for the array inside the loop
-    Value idxAlloca = rewriter.create<cir::AllocaOp>(
-        loc, cir::PointerType::get(ctx, i32Ty), i32Ty, "iov_idx", alignAttr);
-    Value zero = rewriter.create<cir::ConstantOp>(loc, i32Ty, rewriter.getI32IntegerAttr(0));
-    rewriter.create<cir::StoreOp>(loc, zero, idxAlloca);
-
-    rewriter.setInsertionPoint(writeCall);
-
-    Value currentIdx = rewriter.create<cir::LoadOp>(loc, i32Ty, idxAlloca);
+    Value tripCountVal = rewriter.create<arith::ConstantIndexOp>(loc, tripCount);
 
     Value fdArg = writeCall.getOperand(0);
     Value bufArg = writeCall.getOperand(1);
     Value lenArg = writeCall.getOperand(2);
 
-    // Store buffer pointer and length into our pre-allocated arrays
-    Value targetPtrSlot = rewriter.create<cir::GetArrayElementOp>(
-        loc, cir::PointerType::get(ctx, ptrTy), iovPtrs, currentIdx);
-    Value targetSizeSlot = rewriter.create<cir::GetArrayElementOp>(
-        loc, cir::PointerType::get(ctx, i64Ty), iovSizes, currentIdx);
+    // Use standard MemRef for the batching arrays, exactly like the SCF pattern!
+    auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, bufArg.getType());
+    auto sizeArrayType = MemRefType::get({ShapedType::kDynamic}, lenArg.getType());
 
-    rewriter.create<cir::StoreOp>(loc, bufArg, targetPtrSlot);
-    rewriter.create<cir::StoreOp>(loc, lenArg, targetSizeSlot);
+    Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, ValueRange{tripCountVal});
+    Value sizesMemref = rewriter.create<memref::AllocaOp>(loc, sizeArrayType, ValueRange{tripCountVal});
+
+    // Track the array index inside the loop using a 1-element memref
+    auto idxArrayType = MemRefType::get({1}, rewriter.getIndexType());
+    Value idxAlloca = rewriter.create<memref::AllocaOp>(loc, idxArrayType);
+    Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    rewriter.create<memref::StoreOp>(loc, zeroIdx, idxAlloca, ValueRange{zeroIdx});
+
+    rewriter.setInsertionPoint(writeCall);
+
+    Value currentIdx = rewriter.create<memref::LoadOp>(loc, idxAlloca, ValueRange{zeroIdx});
+
+    // Store buffer pointer and length into the memrefs
+    rewriter.create<memref::StoreOp>(loc, bufArg, ptrsMemref, ValueRange{currentIdx});
+    rewriter.create<memref::StoreOp>(loc, lenArg, sizesMemref, ValueRange{currentIdx});
     
     // Increment index: idx++
-    Value one = rewriter.create<cir::ConstantOp>(loc, i32Ty, rewriter.getI32IntegerAttr(1));
-    Value nextIdx = rewriter.create<cir::BinOp>(loc, i32Ty, cir::BinOpKind::Add, currentIdx, one);
-    rewriter.create<cir::StoreOp>(loc, nextIdx, idxAlloca);
+    Value oneIdx = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value nextIdx = rewriter.create<arith::AddIOp>(loc, currentIdx, oneIdx);
+    rewriter.create<memref::StoreOp>(loc, nextIdx, idxAlloca, ValueRange{zeroIdx});
 
     // Erase the original write call safely
     rewriter.eraseOp(writeCall);
 
-    // Use the Operation* (op) for the insertion point
     rewriter.setInsertionPointAfter(op);
 
-    // Inject the high-level BatchWriteVOp (with the i64 return type!)
-    Value tripCountVal = rewriter.create<arith::ConstantIndexOp>(loc, tripCount);
-    rewriter.create<io::BatchWriteVOp>(loc, rewriter.getI64Type(), fdArg, iovPtrs, iovSizes, tripCountVal);
+    // Inject the high-level BatchWriteVOp with perfectly matched MemRef types
+    rewriter.create<io::BatchWriteVOp>(loc, rewriter.getI64Type(), fdArg, ptrsMemref, sizesMemref, tripCountVal);
 
     return success();
   }
@@ -262,54 +246,34 @@ struct CirLoopBatchingPattern : public OpInterfaceRewritePattern<cir::LoopOpInte
 struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
   using OpRewritePattern<scf::ForOp>::OpRewritePattern;
 
-    LogicalResult matchAndRewrite(cir::LoopOpInterface loopInterface, PatternRewriter &rewriter) const override {
-    Operation *op = loopInterface.getOperation();
-    
-    Region *bodyRegion = nullptr;
-    Region *condRegion = nullptr;
+  LogicalResult matchAndRewrite(scf::ForOp loop, PatternRewriter &rewriter) const override {
+    Block *body = loop.getBody();
+    if (!body || body->empty()) return failure();
 
-    // Safely cast to the concrete loop types to access their specific regions
-    if (auto forOp = dyn_cast<cir::ForOp>(op)) {
-      bodyRegion = &forOp.getBody();
-      condRegion = &forOp.getCond();
-    } else if (auto whileOp = dyn_cast<cir::WhileOp>(op)) {
-      bodyRegion = &whileOp.getBody();
-      condRegion = &whileOp.getCond();
-    } else {
-      return failure(); // Unrecognized CIR loop type
+    io::WriteOp writeOp = nullptr;
+    bool hasSideEffects = false;
+
+    // Detect if this is a pure I/O loop
+    for (Operation &op : *body) {
+      if (isa<scf::YieldOp>(op)) continue; 
+
+      if (auto ioWrite = dyn_cast<io::WriteOp>(op)) {
+        if (writeOp) { hasSideEffects = true; break; }
+        writeOp = ioWrite;
+      } else if (!isMemoryEffectFree(&op)) {
+        hasSideEffects = true; break; 
+      }
     }
 
-    if (!bodyRegion || bodyRegion->empty()) return failure();
+    if (hasSideEffects || !writeOp) return failure();
+    if (!loop.isDefinedOutsideOfLoop(writeOp.getFd())) return failure();
 
-    cir::CallOp writeCall = nullptr;
-    // Walk the body to find a 'write' call
-    bodyRegion->walk([&](cir::CallOp call) {
-      auto callee = call.getCallee();
-      if (callee && callee->starts_with("write")) {
-        writeCall = call;
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
+    Location loc = loop.getLoc();
+    Value diff = rewriter.create<arith::SubIOp>(loc, loop.getUpperBound(), loop.getLowerBound());
+    Value tripCount = rewriter.create<arith::DivSIOp>(loc, diff, loop.getStep());
+    Value tripCountI64 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), tripCount);
 
-    if (!writeCall) return failure();
-
-    // Extract Trip Count from the Condition Region
-    int64_t tripCount = -1;
-    condRegion->walk([&](cir::CmpOp cmp) {
-      if (auto constOp = cmp.getRhs().getDefiningOp<cir::ConstantOp>()) {
-        if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
-          tripCount = intAttr.getInt();
-      }
-    });
-
-    if (tripCount <= 1) return failure();
-
-    Location loc = op->getLoc();
-    auto ctx = rewriter.getContext();
-
-    // Make sure we pass the Operation* to setInsertionPoint
-    rewriter.setInsertionPoint(op);
+    rewriter.setInsertionPoint(loop);
 
     // Contiguous vs Vector Routing
     Value basePointer;
@@ -475,6 +439,40 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
   }
 };
 
+struct StripCIRAttrsPass : public PassWrapper<StripCIRAttrsPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(StripCIRAttrsPass)
+
+  llvm::StringRef getArgument() const final { return "strip-cir-attrs"; }
+  llvm::StringRef getDescription() const final { return "Strips leftover CIR attributes before LLVM translation."; }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    
+    // Walk every single operation in the entire file (Functions, Globals, Blocks)
+    module.walk([&](Operation *op) {
+      SmallVector<StringAttr, 4> attrsToRemove;
+      
+      // Look at all attributes attached to this operation
+      for (NamedAttribute attr : op->getAttrs()) {
+        llvm::StringRef name = attr.getName().getValue();
+        
+        // If it's a ClangIR leftover, mark it for death
+        if (name.starts_with("cir.") || 
+            name == "cxx_special_member" || 
+            name == "global_visibility" ||
+            name == "sym_visibility") {
+          attrsToRemove.push_back(attr.getName());
+        }
+      }
+      
+      // Remove them cleanly using the MLIR API (No more broken commas!)
+      for (StringAttr attrName : attrsToRemove) {
+        op->removeAttr(attrName);
+      }
+    });
+  }
+};
+
 /// The MLIR Pass Wrapper
 struct IOLoopBatchingPass : public PassWrapper<IOLoopBatchingPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(IOLoopBatchingPass)
@@ -518,9 +516,14 @@ std::unique_ptr<mlir::Pass> createIOLoopBatchingPass() {
   return std::make_unique<IOLoopBatchingPass>(); 
 }
 
+std::unique_ptr<mlir::Pass> createStripCIRAttrsPass() {
+  return std::make_unique<StripCIRAttrsPass>(); 
+}
+
 // Register the pass so `io-opt` knows it exists
 void registerIOPasses() {
   mlir::PassRegistration<IOLoopBatchingPass>();
+  mlir::PassRegistration<StripCIRAttrsPass>();
 }
 
 } // namespace io

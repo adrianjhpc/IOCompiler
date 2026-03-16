@@ -65,38 +65,9 @@ def compile_to_bitcode(source_file, output_bc, flags):
              "-o", llvm_dialect_file], 
             f"Lowering to LLVM Dialect")
 
-    with open(llvm_dialect_file, "r") as f:
-        mlir_data = f.read()
-    
-    import re
-    # 1. Erase global alias definitions for #cir and #fn_attr
-    mlir_data = re.sub(r'^#(cir|fn_attr).*?\n', '', mlir_data, flags=re.MULTILINE)
-    
-    # 2. Erase CIR attributes that use angled brackets
-    mlir_data = re.sub(r'cir\.[a-zA-Z0-9_]+\s*=\s*#[a-zA-Z0-9_.]+<[^>]*>', '', mlir_data)
-    
-    # 3. Erase CIR attributes that use square arrays
-    mlir_data = re.sub(r'cir\.[a-zA-Z0-9_]+\s*=\s*\[[^\]]*\]', '', mlir_data)
-    
-    # 4. Erase any remaining simple CIR attributes
-    mlir_data = re.sub(r'cir\.[a-zA-Z0-9_]+\s*=\s*[^,}\n]+', '', mlir_data)
-    
-    # 5. Erase specific ClangIR C++ metadata leaking into standard attributes
-    mlir_data = re.sub(r'cxx_special_member\s*=\s*#[a-zA-Z0-9_.]+<[^>]*>', '', mlir_data)
-    mlir_data = re.sub(r'global_visibility\s*=\s*#[a-zA-Z0-9_.]+<[^>]*>', '', mlir_data)
-    
-    # 6. Cleanup the broken commas left behind (THE FIX)
-    prev_len = 0
-    while len(mlir_data) != prev_len:
-        prev_len = len(mlir_data)
-        mlir_data = re.sub(r',\s*,', ',', mlir_data) # Collapse multi-commas
-        
-    mlir_data = re.sub(r'{\s*,', '{', mlir_data)     # Drop comma after {
-    mlir_data = re.sub(r',\s*}', '}', mlir_data)     # Drop comma before }
-    mlir_data = mlir_data.replace('attributes { }', '').replace('attributes {}', '')
-
-    with open(llvm_dialect_file, "w") as f:
-        f.write(mlir_data)
+    # Tidy up the CIR output
+    run_cmd([IO_OPT, llvm_dialect_dirty_file, "--strip-cir-attrs", "-o", llvm_dialect_clean_file], 
+            f"Stripping ClangIR Attributes")
 
     # Translate: Pure LLVM Dialect to LLVM IR
     run_cmd([MLIR_TRANSLATE, "--mlir-to-llvmir", llvm_dialect_file, "-o", ll_file], 
