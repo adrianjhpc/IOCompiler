@@ -10,7 +10,7 @@
 NOINLINE void test_contiguous_write(int fd) {
     char buffer[10] = "012345678";
     // We relax the regex to ignore 'noundef' and other attributes
-    // CHECK: call {{.*}} @write(i32 %fd, ptr {{.*}}, i64 4)
+    // CHECK: call {{.*}} @write(i32 %{{.*}}, ptr {{.*}}, i64 4)
     write(fd, &buffer[0], 2);
     write(fd, &buffer[2], 2);
 }

@@ -13,18 +13,19 @@ func.func @test_contiguous_write(%fd: i32, %base_ptr: !llvm.ptr) {
     // Ensure the original scf.for loop is completely erased
     // CHECK-NOT: scf.for
 
-    // Ensure we calculate the trip count and total size mathematically
-    // CHECK: %[[TRIP_COUNT:.*]] = arith.divsi
-    // CHECK: %[[TOTAL_SIZE:.*]] = arith.muli %[[TRIP_COUNT]], %{{.*}} : i64
+    // Ensure the compiler constant-folded the trip count and size to 100
+    // CHECK: %[[TOTAL_SIZE:.*]] = arith.constant 100 : i64
 
     // Ensure we emit the massive batched write using the base pointer
-    // CHECK: io.batch_write(%arg0, %arg1, %[[TOTAL_SIZE]]) : i32, !llvm.ptr, i64 -> i64
-    
+    // CHECK: io.batch_write %arg0, %arg1, %[[TOTAL_SIZE]] : !llvm.ptr
+ 
     scf.for %iv = %c0 to %c100 step %step {
-        // Because step (1) == write_size (1), our verifySCEVOffset function 
-        // will correctly flag this as perfectly contiguous memory!
-        %ptr = llvm.getelementptr %base_ptr[%iv] : (!llvm.ptr, index) -> !llvm.ptr, i8
-        %res = io.write(%fd, %ptr, %write_size) : i32, !llvm.ptr, i64 -> i64
+        // Cast the loop index to a concrete 64-bit integer for LLVM
+        %iv_i64 = arith.index_cast %iv : index to i64
+        
+        // Use the i64 value for the pointer offset
+        %ptr = llvm.getelementptr %base_ptr[%iv_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+        %res = io.write %fd, %ptr, %write_size : !llvm.ptr
     }
 
     return
@@ -54,10 +55,13 @@ func.func @test_strided_write(%fd: i32, %base_ptr: !llvm.ptr) {
     // CHECK-NOT: io.write
 
     // ...and replaced with our Scatter/Gather I/O operation outside the loop
-    // CHECK: io.batch_writev(%arg0, %{{.*}}, %{{.*}}, %{{.*}})
-    
+    // CHECK: io.batch_writev %arg0, %{{.*}}, %{{.*}}, %{{.*}} : memref<?x!llvm.ptr>, memref<?xi64>
+
     scf.for %iv = %c0 to %c100 step %step {
-        // Because step (2) != write_size (1), verifySCEVOffset will abort the 
-        // contiguous path and trigger our Vector Fallback
-        %ptr = llvm.getelementptr %base_ptr[%iv] : (!llvm.ptr, index) -> !llvm.ptr, i8
-        %res = io.write(%fd, %ptr, %
+        %iv_i64 = arith.index_cast %iv : index to i64
+        %ptr = llvm.getelementptr %base_ptr[%iv_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+        %res = io.write %fd, %ptr, %write_size : !llvm.ptr
+    }
+
+    return
+} 

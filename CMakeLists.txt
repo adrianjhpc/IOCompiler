@@ -38,11 +38,11 @@ if(LIT_TOOL)
 
 
     # Find test tools on the current system
-    find_program(CLANG_PATH NAMES clang-20 clang)
-    find_program(CLANGPP_PATH NAMES clang++-20 clang++)
-    find_program(OPT_PATH NAMES opt-20 opt)
+    find_program(CLANG_PATH NAMES clang)
+    find_program(CLANGPP_PATH NAMES clang++)
+    find_program(OPT_PATH NAMES opt)
     find_program(FILECHECK_PATH NAMES FileCheck-20 FileCheck)
-    find_program(LLVM_LINK_PATH NAMES llvm-link-20 llvm-link)
+    find_program(LLVM_LINK_PATH NAMES llvm-link)
      
     set(IO_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
     set(IO_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
@@ -60,7 +60,6 @@ if(LIT_TOOL)
         # Run lit on the test/ directory, passing the -v (verbose) flag
         COMMAND ${LIT_TOOL} -v ${CMAKE_CURRENT_SOURCE_DIR}/llvm-tests
         
-        # VERY IMPORTANT: Make the tests depend on the pass itself!
         # This forces CMake to recompile IOOpt.so if you changed the C++ code
         # before running the tests.
         DEPENDS IOOpt
@@ -72,17 +71,16 @@ if(LIT_TOOL)
         USES_TERMINAL
     )
 
-    #MLIR tests
     configure_lit_site_cfg(
         ${CMAKE_CURRENT_SOURCE_DIR}/mlir-tests/lit.site.cfg.py.in
-        ${CMAKE_CURRENT_BINARY_DIR}/mlir0test/lit.site.cfg.py
+        ${CMAKE_CURRENT_BINARY_DIR}/mlir-tests/lit.site.cfg.py
     )
 
-        add_custom_target(check-mlir
+    #MLIR tests
+    add_custom_target(check-mlir
         # Run lit on the test/ directory, passing the -v (verbose) flag
         COMMAND ${LIT_TOOL} -v ${CMAKE_CURRENT_SOURCE_DIR}/mlir-tests
 
-        # VERY IMPORTANT: Make the tests depend on the pass itself!
         # This forces CMake to recompile IOOpt.so if you changed the C++ code
         # before running the tests.
         DEPENDS io-opt 
@@ -93,6 +91,28 @@ if(LIT_TOOL)
         # Give lit direct access to the terminal so its colored output works
         USES_TERMINAL
     )
+
+    configure_lit_site_cfg(
+        ${CMAKE_CURRENT_SOURCE_DIR}/combined-tests/lit.site.cfg.py.in
+        ${CMAKE_CURRENT_BINARY_DIR}/combined-tests/lit.site.cfg.py
+    )
+
+    #Combined tests
+    add_custom_target(check-mlir
+        # Run lit on the test/ directory, passing the -v (verbose) flag
+        COMMAND ${LIT_TOOL} -v ${CMAKE_CURRENT_SOURCE_DIR}/combined-tests
+
+        # This forces CMake to recompile IOOpt.so if you changed the C++ code
+        # before running the tests.
+        DEPENDS io-opt
+
+        # Print a nice message when it starts
+        COMMENT "Running combined IOOpt test suite..."
+
+        # Give lit direct access to the terminal so its colored output works
+        USES_TERMINAL
+    )
+
 
 else()
     message(WARNING "Could not find the 'lit' tool. The 'make check' target will not be created.")

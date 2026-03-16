@@ -27,13 +27,15 @@ struct LiftWritePattern : public OpRewritePattern<func::CallOp> {
     Value count = callOp.getOperand(2);
 
     // Upgrade to our custom dialect
-    auto ioWrite = rewriter.create<io::WriteOp>(
+    auto ioWrite = io::WriteOp::create(
+        rewriter,
         callOp.getLoc(),
         callOp.getResultTypes().front(), // Maintain the original return type (usually i64)
         fd,
         buf,
         count
     );
+
 
     // Replace the generic call with our semantic operation
     rewriter.replaceOp(callOp, ioWrite.getResult());
@@ -57,7 +59,8 @@ struct LiftReadPattern : public OpRewritePattern<func::CallOp> {
     Value buf = callOp.getOperand(1);
     Value count = callOp.getOperand(2);
 
-    auto ioRead = rewriter.create<io::ReadOp>(
+    auto ioRead = io::ReadOp::create(
+        rewriter,
         callOp.getLoc(),
         callOp.getResultTypes().front(), 
         fd,
@@ -75,6 +78,10 @@ struct RecognizeIOPass : public PassWrapper<RecognizeIOPass, OperationPass<Modul
 
   llvm::StringRef getArgument() const final { return "recognise-io"; }
   llvm::StringRef getDescription() const final { return "Lifts standard C library I/O calls into the custom IO dialect."; }
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<io::IODialect>();
+  }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();

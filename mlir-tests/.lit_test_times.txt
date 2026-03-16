@@ -1,2 +1,6 @@
-1.038289e-02 loop_batching.mlir
-1.171780e-02 lowering_to_llvm.mlir
+1.142573e-02 loop_batching.mlir
+1.257563e-02 lowering_to_llvm.mlir
+1.180267e-02 recognise-io.mlir
+1.304197e-02 test_loop_batching.mlir
+1.297045e-02 test_read_batching.mlir
+1.255536e-02 test_hazards.mlir

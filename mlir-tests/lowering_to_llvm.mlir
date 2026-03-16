@@ -5,12 +5,9 @@
 // CHECK: llvm.func @write(i32, !llvm.ptr, i64) -> i64
 
 // CHECK-LABEL: func.func @test_lowering_batch_write
-func.func @test_lowering_batch_write(%fd: index, %buf: memref<100xi8>, %size: index) {
-
-  // Here is our optimized MLIR operation
-  %bytes_written = io.batch_write %fd, %buf, %size : memref<100xi8>
-
-  return
+func.func @test_lowering_batch_write(%fd: i32, %buf: memref<100xi8>, %size: i64) {
+    %bytes_written = io.batch_write %fd, %buf, %size : memref<100xi8>
+    return
 }
 
 // And we expect our `io.batch_write` to be replaced by an LLVM call to that C function!

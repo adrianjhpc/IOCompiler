@@ -3,6 +3,7 @@
 #include "mlir/Transforms/DialectConversion.h"        // NEEDED for applyPartialConversion
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Pass/Pass.h"
 
 #include "IODialect.h"
@@ -32,13 +33,13 @@ struct BatchWriteLowering : public ConvertOpToLLVMPattern<io::BatchWriteOp> {
     }
 
     // Cast the MLIR types down to raw LLVM types
-    Value fdI32 = rewriter.create<LLVM::TruncOp>(op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
+    Value fdI32 = LLVM::TruncOp::create(rewriter, op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
 
     // Safely handle both MemRefs and raw LLVM Pointers
     Value rawPtr;
     if (auto memrefType = mlir::dyn_cast<MemRefType>(op.getBuffer().getType())) {
         // It's a MemRef descriptor: extract the raw contiguous pointer
-        rawPtr = getStridedElementPtr(op.getLoc(), memrefType, adaptor.getBuffer(), {}, rewriter);
+        rawPtr = getStridedElementPtr(rewriter, op.getLoc(), memrefType, adaptor.getBuffer(), {});
     } else {
         // It's already a raw pointer (from C/C++ frontend)
         rawPtr = adaptor.getBuffer();
@@ -88,8 +89,8 @@ struct BatchWriteVLowering : public ConvertOpToLLVMPattern<io::BatchWriteVOp> {
     // Extract the raw contiguous base pointers from the lowered MemRef descriptors
     auto ptrsMemRefTy = cast<MemRefType>(op.getPtrs().getType());
     auto sizesMemRefTy = cast<MemRefType>(op.getSizes().getType());
-    Value ptrsRaw = getStridedElementPtr(loc, ptrsMemRefTy, adaptor.getPtrs(), {}, rewriter);
-    Value sizesRaw = getStridedElementPtr(loc, sizesMemRefTy, adaptor.getSizes(), {}, rewriter);
+    Value ptrsRaw = getStridedElementPtr(rewriter, loc, ptrsMemRefTy, adaptor.getPtrs(), {});
+    Value sizesRaw = getStridedElementPtr(rewriter, loc, sizesMemRefTy, adaptor.getSizes(), {});
 
     // Generate a loop to populate the iovec array
     Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -126,7 +127,7 @@ struct BatchWriteVLowering : public ConvertOpToLLVMPattern<io::BatchWriteVOp> {
     rewriter.setInsertionPointAfter(loop);
 
     // Make the single, optimised, system call
-    Value fdI32 = rewriter.create<LLVM::TruncOp>(loc, rewriter.getI32Type(), adaptor.getFd());
+    Value fdI32 = LLVM::TruncOp::create(rewriter, op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
     auto llvmCall = rewriter.create<LLVM::CallOp>(
         loc, writevFunc, ValueRange{fdI32, iovecArrayPtr, vectorCountI32});
 
@@ -153,26 +154,28 @@ struct BatchReadLowering : public ConvertOpToLLVMPattern<io::BatchReadOp> {
           rewriter.getI64Type(),
           {rewriter.getI32Type(), LLVM::LLVMPointerType::get(rewriter.getContext()), rewriter.getI64Type()}
       );
-      readFunc = rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), "read", readType);
+      readFunc = LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), "read", readType);
     }
 
-    Value fdI32 = rewriter.create<LLVM::TruncOp>(op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
-
+    Value fdI32 = LLVM::TruncOp::create(rewriter, op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
+    
     // Safely handle both MemRefs and raw LLVM Pointers
     Value rawPtr;
     if (auto memrefType = mlir::dyn_cast<MemRefType>(op.getBuffer().getType())) {
         // It's a MemRef descriptor: extract the raw contiguous pointer
-        rawPtr = getStridedElementPtr(op.getLoc(), memrefType, adaptor.getBuffer(), {}, rewriter);
+        rawPtr = getStridedElementPtr(rewriter, op.getLoc(), memrefType, adaptor.getBuffer(), {});
     } else {
         // It's already a raw pointer (from C/C++ frontend)
         rawPtr = adaptor.getBuffer();
     }
 
-    auto llvmCall = rewriter.create<LLVM::CallOp>(
+    auto llvmCall = LLVM::CallOp::create(
+        rewriter,
         op.getLoc(),
         readFunc,
         ValueRange{fdI32, rawPtr, adaptor.getTotalSize()}
     );
+
 
     rewriter.replaceOp(op, llvmCall.getResult());
     return success();
@@ -201,7 +204,8 @@ struct BatchReadVLowering : public ConvertOpToLLVMPattern<io::BatchReadVOp> {
       rewriter.setInsertionPointToStart(module.getBody());
       auto readvType = LLVM::LLVMFunctionType::get(
           sizeTy, {rewriter.getI32Type(), voidPtrTy, rewriter.getI32Type()});
-      readvFunc = rewriter.create<LLVM::LLVMFuncOp>(loc, "readv", readvType);
+      readvFunc = LLVM::LLVMFuncOp::create(rewriter, loc, "readv", readvType);
+
     }
 
     // Allocate the array of iovec structs on the stack (alloca)
@@ -212,8 +216,8 @@ struct BatchReadVLowering : public ConvertOpToLLVMPattern<io::BatchReadVOp> {
     // Extract the raw contiguous base pointers from the lowered MemRef descriptors
     auto ptrsMemRefTy = cast<MemRefType>(op.getPtrs().getType());
     auto sizesMemRefTy = cast<MemRefType>(op.getSizes().getType());
-    Value ptrsRaw = getStridedElementPtr(loc, ptrsMemRefTy, adaptor.getPtrs(), {}, rewriter);
-    Value sizesRaw = getStridedElementPtr(loc, sizesMemRefTy, adaptor.getSizes(), {}, rewriter);
+    Value ptrsRaw = getStridedElementPtr(rewriter, loc, ptrsMemRefTy, adaptor.getPtrs(), {});
+    Value sizesRaw = getStridedElementPtr(rewriter, loc, sizesMemRefTy, adaptor.getSizes(), {});
 
     // Generate an SCF loop to populate the iovec array
     Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -250,7 +254,7 @@ struct BatchReadVLowering : public ConvertOpToLLVMPattern<io::BatchReadVOp> {
     rewriter.setInsertionPointAfter(loop);
 
     // Make the optimised gather I/O system call
-    Value fdI32 = rewriter.create<LLVM::TruncOp>(loc, rewriter.getI32Type(), adaptor.getFd());
+    Value fdI32 = LLVM::TruncOp::create(rewriter, op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
     auto llvmCall = rewriter.create<LLVM::CallOp>(
         loc, readvFunc, ValueRange{fdI32, iovecArrayPtr, vectorCountI32});
 
@@ -271,6 +275,7 @@ struct ConvertIOToLLVMPass : public PassWrapper<ConvertIOToLLVMPass, OperationPa
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<LLVM::LLVMDialect>();
     registry.insert<scf::SCFDialect>();
+    registry.insert<memref::MemRefDialect>();
   }
 
   void runOnOperation() override {
@@ -283,6 +288,7 @@ struct ConvertIOToLLVMPass : public PassWrapper<ConvertIOToLLVMPass, OperationPa
 
     // Set up the Conversion Target
     ConversionTarget target(*context);
+    target.addLegalDialect<memref::MemRefDialect>();
     target.addLegalDialect<LLVM::LLVMDialect>();
     target.addLegalDialect<scf::SCFDialect>();
     target.addIllegalOp<io::BatchWriteOp>();

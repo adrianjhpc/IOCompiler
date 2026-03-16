@@ -1,7 +1,7 @@
 // RUN: io-opt %s -io-loop-batching | FileCheck %s
 
 // CHECK-LABEL: func.func @test_simple_loop_batching
-func.func @test_simple_loop_batching(%fd: index, %buf: memref<100xi8>, %size: index) {
+func.func @test_simple_loop_batching(%fd: i32, %buf: memref<100xi8>, %size: i64) {  
   %c0 = arith.constant 0 : index
   %c10 = arith.constant 10 : index
   %c1 = arith.constant 1 : index

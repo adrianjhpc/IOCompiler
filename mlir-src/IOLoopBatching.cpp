@@ -5,11 +5,9 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-
-
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 
 #include "IODialect.h"
 
@@ -29,7 +27,11 @@ static std::optional<int64_t> getConstantIntValue(Value val) {
 // Proves that: (Offset_Multiplier * Loop_Step) == Write_Size
 static bool verifySCEVOffset(Value dynamicOffset, scf::ForOp loop, Value writeSize) {
     Value iv = loop.getInductionVar();
-    
+   
+    if (auto castOp = dynamicOffset.getDefiningOp<arith::IndexCastOp>()) {
+        dynamicOffset = castOp.getIn();
+    }
+ 
     // Attempt to resolve the writeSize and step to compile-time constants
     auto optWriteSize = getConstantIntValue(writeSize);
     auto optStep = getConstantIntValue(loop.getStep());
@@ -186,7 +188,7 @@ struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
         rewriter.create<io::BatchWriteOp>(loc, rewriter.getI64Type(), writeOp.getFd(), basePointer, totalSize);
     } else {
         // Fallback to scattered writes (writev) 
-        auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, LLVM::LLVMPointerType::get(getContext()));
+        auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, writeOp.getBuffer().getType());
         auto sizeArrayType = MemRefType::get({ShapedType::kDynamic}, rewriter.getI64Type());
         
         Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, tripCount);
@@ -217,7 +219,7 @@ struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
 
         // Emit the batched scatter operation after the calculation loop
         rewriter.setInsertionPointAfter(calcLoop);
-        rewriter.create<io::BatchWriteVOp>(loc, writeOp.getFd(), ptrsMemref, sizesMemref, tripCount);
+        rewriter.create<io::BatchWriteVOp>(loc, rewriter.getI64Type(), writeOp.getFd(), ptrsMemref, sizesMemref, tripCount);
     }
 
     // Completely erase the original write loop
@@ -295,7 +297,7 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
         rewriter.create<io::BatchReadOp>(loc, rewriter.getI64Type(), readOp.getFd(), basePointer, totalSize);
     } else {
         // Gather (readv)
-        auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, LLVM::LLVMPointerType::get(getContext()));
+        auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, readOp.getBuffer().getType());
         auto sizeArrayType = MemRefType::get({ShapedType::kDynamic}, rewriter.getI64Type());
 
         Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, tripCount);
@@ -329,7 +331,7 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
 
         // Emit the batched gather operation immediately after our calculation loop
         rewriter.setInsertionPoint(loop); 
-        rewriter.create<io::BatchReadVOp>(loc, readOp.getFd(), ptrsMemref, sizesMemref, tripCount);
+        rewriter.create<io::BatchReadVOp>(loc, rewriter.getI64Type(), readOp.getFd(), ptrsMemref, sizesMemref, tripCount);
     }
 
     // Clean up the original loop
@@ -349,6 +351,13 @@ struct IOLoopBatchingPass : public PassWrapper<IOLoopBatchingPass, OperationPass
   llvm::StringRef getArgument() const final { return "io-loop-batching"; }
   llvm::StringRef getDescription() const final { return "Hoists and batches I/O operations from scf.for loops."; }
 
+  // The Pass Manager runs this sequentially before spinning up the threads
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<io::IODialect>();
+    registry.insert<scf::SCFDialect>();
+    registry.insert<arith::ArithDialect>();
+    registry.insert<memref::MemRefDialect>();
+  }
 
   void runOnOperation() override {
     func::FuncOp func = getOperation();
