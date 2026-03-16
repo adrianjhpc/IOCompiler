@@ -10,6 +10,9 @@ mlir-tests/Output/
 mlir-tests/lit.site.cfg.py
 combined-tests/test_app
 combined-tests/test_app_orig
+combined-tests/*.bc
+combined-tests/*.ll
+combined-tests/*.mlir
 testing/fio-lto-optimised/
 testing/fio-lto-original/
 testing/fio-optimised/
