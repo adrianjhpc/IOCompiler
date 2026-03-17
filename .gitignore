@@ -13,6 +13,7 @@ combined-tests/test_app_orig
 combined-tests/*.bc
 combined-tests/*.ll
 combined-tests/*.mlir
+combined-tests/*.o
 testing/fio-lto-optimised/
 testing/fio-lto-original/
 testing/fio-optimised/
@@ -22,4 +23,5 @@ testing/postgres_lto_original
 testing/postgres_optimised
 testing/postgres_lto_optimised
 testing/postgresql-*
+testing/redis-*
 *~
