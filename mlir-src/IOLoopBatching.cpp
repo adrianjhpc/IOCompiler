@@ -161,24 +161,29 @@ struct CirLoopBatchingPattern : public OpRewritePattern<cir::ForOp> {
     Region &bodyRegion = forOp.getBody();
     Region &condRegion = forOp.getCond();
 
-    // 1. Find the write() call
-    cir::CallOp writeCall = nullptr;
+    // 1. Find the read() or write() call
+    cir::CallOp ioCall = nullptr;
+    bool isRead = false; // Flag to tell Phase 3 which operation to generate
+
     bodyRegion.walk([&](cir::CallOp call) {
       if (auto calleeAttr = call->getAttrOfType<FlatSymbolRefAttr>("callee")) {
-        if (calleeAttr.getValue().starts_with("write")) {
-          writeCall = call;
+        StringRef funcName = calleeAttr.getValue();
+        // Check for either write or read
+        if (funcName.starts_with("write") || funcName.starts_with("read")) {
+          ioCall = call;
+          isRead = funcName.starts_with("read"); // True if read, false if write
           return WalkResult::interrupt();
         }
       }
       return WalkResult::advance();
     });
 
-    if (!writeCall) {
-      llvm::errs() << "[IOOpt] Bailing out: No 'write' call found in loop body.\n";
+    if (!ioCall) {
+      llvm::errs() << "[IOOpt] Bailing out: No 'write' or 'read' call found in loop body.\n";
       return failure();
     }
-    llvm::errs() << "[IOOpt] Success: Found write call!\n";
-
+    
+    llvm::errs() << "[IOOpt] Success: Found " << (isRead ? "read" : "write") << " call!\n";
 
     // 2. Extract Upper Bound
     int64_t upperBound = -1;
@@ -267,11 +272,11 @@ struct CirLoopBatchingPattern : public OpRewritePattern<cir::ForOp> {
     Value fdStash = rewriter.create<memref::AllocaOp>(loc, fdStashType);
 
     // --- PHASE 2: INSIDE THE LOOP ---
-    rewriter.setInsertionPoint(writeCall);
+    rewriter.setInsertionPoint(ioCall);
 
-    Value fdArg = writeCall.getOperand(0);
-    Value bufArg = writeCall.getOperand(1);
-    Value lenArg = writeCall.getOperand(2);
+    Value fdArg = ioCall.getOperand(0);
+    Value bufArg = ioCall.getOperand(1);
+    Value lenArg = ioCall.getOperand(2);
 
     Value stdFd = rewriter.create<io::IOCastOp>(loc, stdI32Ty, fdArg);
     Value stdBuf = rewriter.create<io::IOCastOp>(loc, stdI64Ty, bufArg);
@@ -291,18 +296,22 @@ struct CirLoopBatchingPattern : public OpRewritePattern<cir::ForOp> {
     rewriter.create<memref::StoreOp>(loc, nextIdx, idxAlloca, ValueRange{zeroIdx});
 
     // Delete the original write
-    rewriter.eraseOp(writeCall);
+    rewriter.eraseOp(ioCall);
 
     // --- PHASE 3: POST-LOOP ---
     rewriter.setInsertionPointAfter(forOp);
 
-    // Retrieve the smuggled FD!
+    // Retrieve the smuggled FD
     Value finalFd = rewriter.create<memref::LoadOp>(loc, fdStash, ValueRange{zeroIdx});
 
-    // Create the final batched write using the smuggled FD and our arrays
-    rewriter.create<io::BatchWriteVOp>(loc, stdI64Ty, finalFd, ptrsMemref, sizesMemref, tripCountVal);
+    if (isRead) {
+        rewriter.create<io::BatchReadVOp>(loc, stdI64Ty, finalFd, ptrsMemref, sizesMemref, tripCountVal);
+        llvm::errs() << "[IOOpt] AMAZING SUCCESS: Loop optimized to BatchReadVOp!\n";
+    } else {
+        rewriter.create<io::BatchWriteVOp>(loc, stdI64Ty, finalFd, ptrsMemref, sizesMemref, tripCountVal);
+        llvm::errs() << "[IOOpt] AMAZING SUCCESS: Loop optimized to BatchWriteVOp!\n";
+    }
 
-    llvm::errs() << "[IOOpt] AMAZING SUCCESS: Loop optimized to BatchWriteVOp!\n";
     return success();
   }
 };
