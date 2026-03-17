@@ -200,18 +200,36 @@ struct CirLoopBatchingPattern : public OpRewritePattern<cir::ForOp> {
 
     // 3. Extract Step Value
     int64_t stepValue = 1; // Default to 1
+    bool isValidStep = false; // Assume invalid until proven safe
+
     Region &stepRegion = forOp.getStep();
     stepRegion.walk([&](cir::BinOp binOp) {
-      // Find the constant that is being added to the iterator!
+      // If this is not an addition operation, we abort the walk
+      // (cir::BinOpKind::add is the standard ODS-generated enum for cir.binop)
+      if (binOp.getKind() != cir::BinOpKind::Add) {
+        isValidStep = false;
+        return WalkResult::interrupt(); // Stops the walk immediately
+      }
+
+      // It is a safe addition. Now extract the constant operand.
       if (auto constOp = binOp.getOperand(1).getDefiningOp<cir::ConstantOp>()) {
         auto attr = constOp.getValue();
-        if (auto cirInt = dyn_cast<cir::IntAttr>(attr)) {
+        if (auto cirInt = mlir::dyn_cast<cir::IntAttr>(attr)) {
           stepValue = cirInt.getValue().getSExtValue();
-        } else if (auto stdInt = dyn_cast<IntegerAttr>(attr)) {
+          isValidStep = true;
+        } else if (auto stdInt = mlir::dyn_cast<IntegerAttr>(attr)) {
           stepValue = stdInt.getInt();
+          isValidStep = true;
         }
       }
+      return WalkResult::advance(); // Keep walking (or finish)
     });
+
+    // If the walk was interrupted by a bad math operation, or no constant was found, bail out
+    if (!isValidStep) {
+      llvm::errs() << "[IOOpt] Bailing out: Loop step is not a simple addition, or constant is missing.\n";
+      return failure();
+    }
 
     // 4. Calculate True Trip Count
     int64_t lowerBound = 0; 

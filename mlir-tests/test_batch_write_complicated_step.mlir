@@ -67,4 +67,38 @@ module {
     // CHECK: io.batch_writev {{.*}}, {{.*}}, {{.*}}, %[[TRIP_COUNT_2]]
     cir.return
   }
+ 
+  // --- TEST 3: Multiplicative Loop (MUST NOT BE OPTIMIZED) ---
+  // CHECK-LABEL: cir.func @test_step_mul
+  cir.func @test_step_mul(%fd: !s32i, %buf: !cir.ptr<!s8i>) {
+    %0 = cir.alloca !s32i, !cir.ptr<!s32i>, ["i", init] {alignment = 4 : i64}
+    %zero = cir.const #cir.int<1> : !s32i
+    cir.store align(4) %zero, %0 : !s32i, !cir.ptr<!s32i>
+
+    cir.for : cond {
+      %i = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+      %1000 = cir.const #cir.int<1000> : !s32i
+      %cmp = cir.cmp(lt, %i, %1000) : !s32i, !cir.bool
+      cir.condition(%cmp)
+    } body {
+      cir.scope {
+        %len = cir.const #cir.int<32> : !s32i
+        cir.call @write(%fd, %buf, %len) : (!s32i, !cir.ptr<!s8i>, !s32i) -> !s32i
+      }
+      cir.yield
+    } step {
+      %2 = cir.const #cir.int<2> : !s32i
+      %i = cir.load align(4) %0 : !cir.ptr<!s32i>, !s32i
+      // NOTE THE MULTIPLICATION HERE!
+      %next = cir.binop(mul, %i, %2) : !s32i 
+      cir.store align(4) %next, %0 : !s32i, !cir.ptr<!s32i>
+      cir.yield
+    }
+    
+    // FileCheck ensures the original write call is STILL THERE, untouched!
+    // CHECK: cir.call @write
+    // CHECK-NOT: io.batch_writev
+    cir.return
+  }
+
 }
