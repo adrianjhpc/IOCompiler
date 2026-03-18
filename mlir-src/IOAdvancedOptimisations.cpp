@@ -34,7 +34,6 @@ struct PromoteToZeroCopyPattern : public RewritePattern {
         auto getRootAllocation = [](Value v) {
             while (Operation *def = v.getDefiningOp()) {
                 StringRef name = def->getName().getStringRef();
-                // ADDED "cir.get_element" so we can detect buffer[index] mutations!
                 if (name == "cir.cast" || name == "cir.load" || 
                     name == "cir.ptr_stride" || name == "cir.get_element") {
                     v = def->getOperand(0);
@@ -173,33 +172,165 @@ struct ZeroCopyPromotionPass : public PassWrapper<ZeroCopyPromotionPass, Operati
 };
 
 // ============================================================================
-// 2. Straight-Line Serialization -> Basic Block Vectored I/O
+// 2. Straight-Line Serialization -> Basic Block Vectored I/O (Deterministic)
 // ============================================================================
-struct BlockVectoredIOPattern : public RewritePattern {
-    BlockVectoredIOPattern(MLIRContext *context)
-        : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
-
-    LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter) const override {
-        // TODO:
-        // 1. Match a 'write' operation.
-        // 2. Scan the current Basic Block for subsequent 'write' ops to the SAME file descriptor.
-        // 3. Ensure no intervening operations mutate the buffers or branch away.
-        // 4. Gather all buffer pointers and lengths.
-        // 5. Replace the sequence with an 'io.batch_writev' (iovec array) op.
-        return failure();
-    }
-};
-
-struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPass<func::FuncOp>> {
+struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPass<ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BlockVectoredIOPass)
+
     StringRef getArgument() const final { return "io-block-vectored"; }
     StringRef getDescription() const final { return "Batches straight-line sequential writes into writev"; }
 
+    void getDependentDialects(DialectRegistry &registry) const override {
+        registry.insert<func::FuncDialect>();
+    }
+
     void runOnOperation() override {
-        RewritePatternSet patterns(&getContext());
-        patterns.add<BlockVectoredIOPattern>(&getContext());
-        if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))))
-            signalPassFailure();
+        ModuleOp module = getOperation();
+
+        // --------------------------------------------------------------------
+        // Step 1: PRE-PASS (Steal types and inject ioopt_writev_* intrinsics)
+        // --------------------------------------------------------------------
+        CallOpInterface firstWrite = nullptr;
+        module.walk([&](CallOpInterface call) {
+            auto callee = dyn_cast<SymbolRefAttr>(call.getCallableForCallee());
+            if (callee && callee.getRootReference() == "write" && call.getArgOperands().size() == 3) {
+                firstWrite = call;
+                return WalkResult::interrupt();
+            }
+            return WalkResult::advance();
+        });
+
+        // If there are no writes in this module, just exit early!
+        if (!firstWrite) return;
+
+        OpBuilder builder(module.getBodyRegion());
+        Type fdType = firstWrite.getArgOperands()[0].getType();
+        Type ptrType = firstWrite.getArgOperands()[1].getType(); 
+        Type sizeType = firstWrite.getArgOperands()[2].getType();
+        Type retType = firstWrite->getResultTypes()[0];
+        
+        for (int i = 2; i <= 4; ++i) {
+            std::string funcName = "ioopt_writev_" + std::to_string(i);
+            if (!module.lookupSymbol(funcName)) {
+                SmallVector<Type> argTypes;
+                argTypes.push_back(fdType);
+                for(int j = 0; j < i; j++) {
+                    argTypes.push_back(ptrType);
+                    argTypes.push_back(sizeType);
+                }
+                auto funcType = builder.getFunctionType(argTypes, {retType});
+                builder.create<func::FuncOp>(module.getLoc(), funcName, funcType).setPrivate();
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Step 2: DETERMINISTIC TOP-DOWN WALK
+        // --------------------------------------------------------------------
+        // We bypass the greedy pattern rewriter entirely to guarantee order.
+        SmallVector<SmallVector<Operation*, 4>> allBatches;
+
+        module.walk([&](Block *block) {
+            SmallVector<Operation*, 4> currentBatch;
+            Value currentFdRoot = nullptr;
+
+            // Our trusty SSA Root Tracer
+            auto getRootAllocation = [](Value v) {
+                while (Operation *def = v.getDefiningOp()) {
+                    StringRef name = def->getName().getStringRef();
+                    if (name == "cir.load" || name == "cir.cast" || 
+                        name == "cir.get_element" || name == "cir.ptr_stride") {
+                        v = def->getOperand(0);
+                    } else {
+                        break;
+                    }
+                }
+                return v;
+            };
+
+            for (Operation &opRef : *block) {
+                Operation *op = &opRef;
+                
+                // If we find a write, check if we can add it to the current batch
+                if (auto call = dyn_cast<CallOpInterface>(op)) {
+                    auto callee = dyn_cast<SymbolRefAttr>(call.getCallableForCallee());
+                    if (callee && callee.getRootReference() == "write" && call.getArgOperands().size() == 3) {
+                        Value fdRoot = getRootAllocation(call.getArgOperands()[0]);
+                        
+                        if (currentBatch.empty()) {
+                            currentBatch.push_back(op);
+                            currentFdRoot = fdRoot;
+                        } else if (fdRoot == currentFdRoot) {
+                            currentBatch.push_back(op);
+                            if (currentBatch.size() == 4) { // Cap at 4 for intrinsic chunking
+                                allBatches.push_back(currentBatch);
+                                currentBatch.clear();
+                                currentFdRoot = nullptr;
+                            }
+                        } else {
+                            // Hit a write to a DIFFERENT file. Save old batch, start new one.
+                            if (currentBatch.size() >= 2) allBatches.push_back(currentBatch);
+                            currentBatch.clear();
+                            currentBatch.push_back(op);
+                            currentFdRoot = fdRoot;
+                        }
+                        continue;
+                    }
+                }
+
+                StringRef opName = op->getName().getStringRef();
+                
+                // Safe memory preparation instructions (ignore them)
+                if (opName == "cir.load" || opName == "cir.cast" || 
+                    opName == "cir.get_element" || opName == "cir.ptr_stride" ||
+                    opName == "cir.const") {
+                    continue;
+                }
+
+                // HAZARD DETECTED: Bank the current batch and reset!
+                if (currentBatch.size() >= 2) allBatches.push_back(currentBatch);
+                currentBatch.clear();
+                currentFdRoot = nullptr;
+            }
+            
+            // End of the block: Bank any remaining writes
+            if (currentBatch.size() >= 2) allBatches.push_back(currentBatch);
+        });
+
+        // --------------------------------------------------------------------
+        // Step 3: APPLY THE REPLACEMENTS
+        // --------------------------------------------------------------------
+        // We do this AFTER the walk to avoid crashing the block iterator!
+        for (auto &batch : allBatches) {
+            // Insert exactly where the last write was
+            OpBuilder replaceBuilder(batch.back()); 
+            std::string funcName = "ioopt_writev_" + std::to_string(batch.size());
+            
+            SmallVector<Value, 9> newArgs;
+            auto firstWriteInBatch = cast<CallOpInterface>(batch[0]);
+            
+            newArgs.push_back(firstWriteInBatch.getArgOperands()[0]); // Shared FD
+            
+            for (Operation *w : batch) {
+                auto wCall = cast<CallOpInterface>(w);
+                newArgs.push_back(wCall.getArgOperands()[1]); // Buffer
+                newArgs.push_back(wCall.getArgOperands()[2]); // Size
+            }
+
+            auto writevCall = replaceBuilder.create<func::CallOp>(
+                batch.back()->getLoc(),
+                funcName,
+                firstWriteInBatch->getResultTypes(),
+                newArgs
+            );
+
+            // Replace all original writes with the new writev call
+            for (Operation *w : batch) {
+                w->replaceAllUsesWith(writevCall.getResults());
+                w->erase();
+            }
+            
+            llvm::errs() << "[IOOpt-Vectored] SUCCESS: Merged " << batch.size() << " writes into " << funcName << "!\n";
+        }
     }
 };
 
