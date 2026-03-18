@@ -6,6 +6,7 @@ import argparse
 
 TOOLCHAIN_DIR = "/home/adrianj/IOOptCompilerPass/build/mlir-src/"
 LIB_DIR = "/home/adrianj/IOOptCompilerPass/build/llvm-src/"
+RUNTIME_LIB = "/home/adrianj/IOOptCompilerPass/build/runtime_lib/libioopt_runtime.a"
 
 # Define standard toolchain
 CLANG_C = "clang"
@@ -83,6 +84,7 @@ def compile_to_bitcode(source_file, output_bc, target_triple, flags, disable_mli
         IO_OPT, cir_mlir_file,
         "--allow-unregistered-dialect",
         "--io-zero-copy-promotion",
+        "--io-block-vectored",
         "--io-loop-batching", 
         "--cir-to-llvm-inhouse",
         "--convert-io-to-llvm",
@@ -162,7 +164,11 @@ def link_with_lto(input_bcs, output_bin, target_triple, flags, disable_llvm, req
     lto_flags = ["-fuse-ld=lld", "-flto"] 
     
     final_cmd = [linker, lto_opt_bc, "-o", output_bin] + clang_target_flag + shared_flag + lto_flags + flags
-    
+   
+    # If it's linking, inject our runtime library
+    if is_linking and os.path.exists(RUNTIME_LIB):
+        final_clang_cmd.append(RUNTIME_LIB)
+ 
     run_cmd(final_cmd, f"Final Code Generation & Linking ({output_bin} using {linker})")
 
     # Cleanup
