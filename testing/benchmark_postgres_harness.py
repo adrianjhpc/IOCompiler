@@ -83,6 +83,17 @@ def teardown_db(bin_dir, db_dir):
     if os.path.exists(db_dir):
         shutil.rmtree(db_dir)
 
+def stop_db(bin_dir, db_dir):
+    """Stops the database."""
+    print(f"  [Stopping] Stopping the database...")
+    # Use -m fast to forcefully disconnect pgbench if it hangs
+    run_cmd(f"{bin_dir}/pg_ctl -D {db_dir} -m fast stop", check=False, capture=True)
+
+def start_db(bin_dir, db_dir):
+    """Starts the database."""
+    print(f"  [Startup] Starting the database...")
+    run_cmd(f"{bin_dir}/pg_ctl -D {db_dir} -l {db_dir}/logfile -w start", capture=True)
+
 def drop_os_caches():
     """Drops the OS pagecache to ensure read benchmarks hit the disk."""
     run_cmd("sync", capture=True)
@@ -131,7 +142,9 @@ def main():
 
             # 2. Standard Read Test
             setup_db(args.bin_dir, args.db_dir, inject_custom=False)
+            stop_db(args.bin_dir, args.db_dir)
             drop_os_caches()
+            start_db(args.bin_dir, args.db_dir)
             print("  Running Standard Read Test (Select Only)...")
             out = run_cmd(f"{args.bin_dir}/pgbench -S -c 20 -j 4 -T {args.time} test_perf", capture=True, env=env_vars)
             tps, lat = parse_pgbench_output(out)
