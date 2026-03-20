@@ -290,6 +290,33 @@ namespace {
     return false;
   }
 
+  bool isDeeplySafeFromIO(Function *F, SmallPtrSetImpl<Function*> &Visited) {
+      // 1. If it's an external C library call, we can't see inside it. Unsafe.
+      if (!F || F->isDeclaration()) return false; 
+      
+      // 2. Prevent infinite recursion on recursive functions (like in analyze.c!)
+      if (!Visited.insert(F).second) return true; 
+
+      for (BasicBlock &BB : *F) {
+          for (Instruction &I : BB) {
+              // Dealbreaker 1: Volatile memory (Locks, Atomics, Memory Barriers)
+              if (I.isVolatile()) return false;
+
+              // Dealbreaker 2: Calls to unknown functions or known I/O
+              if (auto *Call = dyn_cast<CallInst>(&I)) {
+                  Function *SubCallee = Call->getCalledFunction();
+                  
+                  // If it calls a known I/O intrinsic (write, read, fsync, etc.), abort!
+                  if (getIOArguments(Call, SubCallee).Type != IOArgs::NONE) return false;
+                  
+                  // Recursively check the sub-function
+                  if (!isDeeplySafeFromIO(SubCallee, Visited)) return false;
+              }
+          }
+      }
+      return true; // Clean bill of health! No I/O, no locks found.
+  }
+
   bool isSafeToAddToBatch(const SmallVectorImpl<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL, ScalarEvolution &SE, DominatorTree &DT, PostDominatorTree &PDT) {
     if (Batch.empty()) return true;
 
@@ -397,20 +424,64 @@ namespace {
     auto checkHazard = [&](Instruction *Inst) -> bool {
       if (auto *CI = dyn_cast<CallInst>(Inst)) {
           Function *Callee = CI->getCalledFunction();
-          if (getIOArguments(CI, Callee).Type != IOArgs::NONE) return true;
           
+          // Is it another I/O call? (Definite hazard, break batch)
+          if (getIOArguments(CI, Callee).Type != IOArgs::NONE) return true;
+
+          if (Callee) {
+              // Whitelist purely observational intrinsics
+              if (Callee->isIntrinsic()) {
+                  Intrinsic::ID ID = Callee->getIntrinsicID();
+                  // Do not skip lifetime_start/end. Moving I/O past them causes Use-After-Scope bugs.
+                  // AA will handle lifetime markers correctly below.
+                  if (ID == Intrinsic::dbg_value || ID == Intrinsic::dbg_declare || 
+                      ID == Intrinsic::dbg_label || ID == Intrinsic::assume) {
+                      return false; // Safe to ignore!
+                  }
+              }
+          }
+
+          if (Callee && Callee->hasName()) {
+            StringRef Name = Callee->getName();
+            // Known-safe functions that only read memory or do pure math
+            if (Name == "strlen" || Name == "strnlen" || Name == "strcmp" || 
+              Name == "htons" || Name == "htonl" || Name == "ntohs" || Name == "ntohl" ||
+              Name == "bswap_32" || Name == "bswap_64") {
+              return false; // Safely bypass the batch break!
+            }
+          }
+
           if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) {
-              logMessage("[IOOpt-Debug] Batch Break: Opaque function call may interleave I/O or mutate state.");
-              return true; 
+              if (!CI->onlyAccessesArgMemory()) {
+                  
+                  // NEW: Before we panic and break the batch, let's look inside the function!
+                  if (Callee && !Callee->isDeclaration()) {
+                      SmallPtrSet<Function*, 8> Visited;
+                      
+                      if (isDeeplySafeFromIO(Callee, Visited)) {
+                          // SUCCESS! The function mutates global state (like setting 'errno'), 
+                          // but we mathematically proved it doesn't do I/O or acquire locks.
+                          // It is safe to let it fall through to the Alias Analysis checks below!
+                          return false; 
+                      }
+                  }
+
+                  // If we get here, it's either an external black box or it contains real hazards.
+                  StringRef BadFuncName = Callee ? Callee->getName() : "indirect_call";
+                  logMessage("[IOOpt-Debug] Batch Break: Opaque function '" + BadFuncName + "' may interleave I/O or mutate global state.");
+                  return true; 
+              }
           }
       }
 
+      // Alias Analysis (AA) Checks
       if (FirstArgs.Type == IOArgs::SPLICE || FirstArgs.Type == IOArgs::SENDFILE) return false;
 
       if (Inst->mayReadOrWriteMemory()) {
           if (isReadBatch) {
               if (NewArgs.Buffer->getType()->isPointerTy()) {
                   MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
+                  // For reads: Check if the intervening instruction Reads or Writes our destination
                   if (isModOrRefSet(AA.getModRefInfo(Inst, NewLoc))) {
                       logMessage("[IOOpt-Debug] Batch Break: RAW/WAW dependency on new read buffer.");
                       return true;
@@ -422,6 +493,7 @@ namespace {
                       IOArgs BArgs = getIOArguments(BC);
                       if (!BArgs.Buffer || !BArgs.Buffer->getType()->isPointerTy()) continue;
                       MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
+                      // For writes: Only check if the intervening instruction Modifies our source buffer
                       if (isModSet(AA.getModRefInfo(Inst, BLoc))) {
                           logMessage("[IOOpt-Debug] Batch Break: WAR dependency on batched write buffer.");
                           return true; 

@@ -275,7 +275,13 @@ def main():
         "execPartition.c",
         "nodeForeignscan.c",
         "nodeLockRows.c",
-        "nodeModifyTable.c"     
+        "nodeModifyTable.c",
+        "foreign.c",
+        "outfuncs.c",
+        "planner.c",
+        "appendinfo.c",
+        "plancat.c",
+        "rewriteHandle"
     ]
 
     if args_c:

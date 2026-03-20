@@ -36,6 +36,7 @@ find_library(TARGET_LOWERING_LIB
 )
 
 
+
 if(NOT MLIRCIR_LIB OR NOT MLIRCIR_INTERFACES_LIB)
     message(FATAL_ERROR "Could not find ClangIR libraries in ${LLVM_LIBRARY_DIR}!")
 endif()
@@ -130,6 +131,10 @@ target_link_libraries(MLIRIOOptimiser PRIVATE
   MLIRLLVMDialect
   MLIRLLVMCommonConversion
   MLIRRegisterAllPasses
+  MLIRSideEffectInterfaces
+  MLIRCallInterfaces
+  MLIRAnalysis
+  MLIRMlirOptMain
   ${MLIRCIR_LIB}
   ${MLIRCIR_INTERFACES_LIB}
   ${CLANGAST_LIB}
@@ -177,5 +182,9 @@ target_link_libraries(io-opt PRIVATE
     MLIRBuiltinToLLVMIRTranslation
     MLIRLLVMToLLVMIRTranslation
     MLIROpenMPToLLVMIRTranslation
+    MLIRSideEffectInterfaces
+    MLIRCallInterfaces
+    MLIRAnalysis
+    MLIRMlirOptMain
     ${LLVM_CORE_DEPS}
 )

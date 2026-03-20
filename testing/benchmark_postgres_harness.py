@@ -59,9 +59,9 @@ def parse_pgbench_output(output):
     lat = float(lat_match.group(1)) if lat_match else 0.0
     return tps, lat
 
-def setup_db(bin_dir, db_dir, inject_custom=False):
+def setup_db(bin_dir, db_dir, inject_custom=False, scale_factor=10):
     """Initializes and starts a fresh database, then runs pgbench init."""
-    print(f"  [Setup] Initializing and starting DB in {db_dir}...")
+    print(f"  [Setup] Initializing DB in {db_dir} (Scale Factor: {scale_factor}). This may take a while...")
     if os.path.exists(db_dir):
         shutil.rmtree(db_dir)
 
@@ -69,7 +69,11 @@ def setup_db(bin_dir, db_dir, inject_custom=False):
     # Put the logfile inside the db_dir to keep the working directory clean
     run_cmd(f"{bin_dir}/pg_ctl -D {db_dir} -l {db_dir}/logfile -w start", capture=True)
     run_cmd(f"{bin_dir}/createdb test_perf", capture=True)
-    run_cmd(f"{bin_dir}/pgbench -i -s 10 test_perf", capture=True)
+    
+    # Initialize pgbench with the requested scale factor.
+    # Added -q (quiet) to prevent massive terminal spam on huge datasets.
+    # Added --foreign-keys to ensure realistic DB constraints.
+    run_cmd(f"{bin_dir}/pgbench -i -s {scale_factor} -q --foreign-keys test_perf", capture=True)
     
     if inject_custom:
         print("  [Setup] Injecting Custom Small I/O Schema...")
@@ -78,7 +82,6 @@ def setup_db(bin_dir, db_dir, inject_custom=False):
 def teardown_db(bin_dir, db_dir):
     """Stops and destroys the database."""
     print(f"  [Teardown] Stopping and cleaning DB in {db_dir}...")
-    # Use -m fast to forcefully disconnect pgbench if it hangs
     run_cmd(f"{bin_dir}/pg_ctl -D {db_dir} -m fast stop", check=False, capture=True)
     if os.path.exists(db_dir):
         shutil.rmtree(db_dir)
@@ -86,7 +89,6 @@ def teardown_db(bin_dir, db_dir):
 def stop_db(bin_dir, db_dir):
     """Stops the database."""
     print(f"  [Stopping] Stopping the database...")
-    # Use -m fast to forcefully disconnect pgbench if it hangs
     run_cmd(f"{bin_dir}/pg_ctl -D {db_dir} -m fast stop", check=False, capture=True)
 
 def start_db(bin_dir, db_dir):
@@ -96,6 +98,7 @@ def start_db(bin_dir, db_dir):
 
 def drop_os_caches():
     """Drops the OS pagecache to ensure read benchmarks hit the disk."""
+    print("  [Cache] Dropping OS page caches...")
     run_cmd("sync", capture=True)
     run_cmd("sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'", check=False, capture=True)
 
@@ -107,12 +110,10 @@ def main():
     parser.add_argument("-t", "--time", type=int, default=60, help="Duration to run each pgbench test in seconds")
     args = parser.parse_args()
 
-    # Define the compiler environments we want to compare
     configs = [
         {"name": "Baseline (Vanilla)", "env": {}}
     ]
 
-    # Initialize nested results dictionary
     metrics = {cfg["name"]: {'std_write': [], 'std_read': [], 'wal_stress': [], 'data_stress': [], 
                              'std_write_lat': [], 'std_read_lat': [], 'wal_stress_lat': [], 'data_stress_lat': []} 
                for cfg in configs}
@@ -121,6 +122,9 @@ def main():
     run_cmd("sudo bash -c exit")
     prepare_sql_files()
 
+    # The Scale Factor for the massive tests (~160GB dataset)
+    MASSIVE_SF = 10000
+
     print(f"=== Starting Full Benchmark Harness ({args.runs} Runs per Config) ===")
 
     for config in configs:
@@ -128,32 +132,46 @@ def main():
         env_vars = config["env"]
         print(f"\n{'='*60}\nEvaluating Configuration: {cfg_name}\n{'='*60}")
 
+        # Initialize the massive DB once for both Read and Write tests
+        setup_db(args.bin_dir, args.db_dir, inject_custom=False, scale_factor=MASSIVE_SF)
+
         for i in range(args.runs):
             print(f"\n--- Run {i+1} of {args.runs} ---")
 
-            # 1. Standard Write Test (TPC-B)
-            setup_db(args.bin_dir, args.db_dir, inject_custom=False)
-            print("  Running Standard Write Test (TPC-B)...")
-            out = run_cmd(f"{args.bin_dir}/pgbench -c 10 -j 2 -T {args.time} test_perf", capture=True, env=env_vars)
-            tps, lat = parse_pgbench_output(out)
-            metrics[cfg_name]['std_write'].append(tps); metrics[cfg_name]['std_write_lat'].append(lat)
-            print(f"    Result -> TPS: {tps:.2f}, Latency: {lat:.3f} ms")
-            teardown_db(args.bin_dir, args.db_dir)
+            # -----------------------------------------------------------------
+            # PHASE 1: MASSIVE DATASET TESTS (> 77GB RAM)
+            # -----------------------------------------------------------------
 
-            # 2. Standard Read Test
-            setup_db(args.bin_dir, args.db_dir, inject_custom=False)
+            # 1. Standard Read Test (Run FIRST to get pristine data)
             stop_db(args.bin_dir, args.db_dir)
             drop_os_caches()
             start_db(args.bin_dir, args.db_dir)
-            print("  Running Standard Read Test (Select Only)...")
-            out = run_cmd(f"{args.bin_dir}/pgbench -S -c 20 -j 4 -T {args.time} test_perf", capture=True, env=env_vars)
+            
+            print(f"  Running Standard Read Test (Massive {MASSIVE_SF} SF)...")
+            out = run_cmd(f"{args.bin_dir}/pgbench -S -c 32 -j 8 -T {args.time} test_perf", capture=True, env=env_vars)
             tps, lat = parse_pgbench_output(out)
             metrics[cfg_name]['std_read'].append(tps); metrics[cfg_name]['std_read_lat'].append(lat)
             print(f"    Result -> TPS: {tps:.2f}, Latency: {lat:.3f} ms")
-            teardown_db(args.bin_dir, args.db_dir)
 
-            # 3. Custom WAL Stress Test (Small I/O)
-            setup_db(args.bin_dir, args.db_dir, inject_custom=True)
+            # 2. Standard Write Test (Run SECOND on the existing massive DB)
+            print(f"  Running Standard Write Test (Massive {MASSIVE_SF} SF)...")
+            # Lowering clients slightly for TPC-B write on a massive DB to prevent immediate locking bottlenecks
+            out = run_cmd(f"{args.bin_dir}/pgbench -c 16 -j 4 -T {args.time} test_perf", capture=True, env=env_vars)
+            tps, lat = parse_pgbench_output(out)
+            metrics[cfg_name]['std_write'].append(tps); metrics[cfg_name]['std_write_lat'].append(lat)
+            print(f"    Result -> TPS: {tps:.2f}, Latency: {lat:.3f} ms")
+            
+        # Now we can safely tear down the 160GB monster
+        teardown_db(args.bin_dir, args.db_dir)
+
+        for i in range(args.runs):
+            print(f"\n--- Run {i+1} of {args.runs} ---")
+
+            # -----------------------------------------------------------------
+            # PHASE 2: CUSTOM STRESS TESTS (Small Data / High Protocol Overhead)
+            # -----------------------------------------------------------------
+            # 3. Custom WAL Stress Test
+            setup_db(args.bin_dir, args.db_dir, inject_custom=True, scale_factor=10)
             print("  Running Custom WAL Stress Test (100-byte Inserts)...")
             out = run_cmd(f"{args.bin_dir}/pgbench -c 10 -j 2 -T {args.time} -f insert_stress.sql test_perf", capture=True, env=env_vars)
             tps, lat = parse_pgbench_output(out)
@@ -162,10 +180,9 @@ def main():
             teardown_db(args.bin_dir, args.db_dir)
 
             # 4. Custom Data File Stress (Unlogged Table)
-            setup_db(args.bin_dir, args.db_dir, inject_custom=True)
+            setup_db(args.bin_dir, args.db_dir, inject_custom=True, scale_factor=10)
             drop_os_caches()
             print("  Running Custom Data Stress Test (Unlogged Function)...")
-            # Note: -t 100 runs the function exactly 100 times per client, generating 1,000,000 internal inserts total
             out = run_cmd(f"{args.bin_dir}/pgbench -c 1 -t 100 -f run_unlogged.sql test_perf", capture=True, env=env_vars)
             tps, lat = parse_pgbench_output(out)
             metrics[cfg_name]['data_stress'].append(tps); metrics[cfg_name]['data_stress_lat'].append(lat)
@@ -204,7 +221,6 @@ def main():
             
     print("="*80 + "\n")
 
-    # Cleanup temporary sql files
     for f in ["setup_schema.sql", "insert_stress.sql", "run_unlogged.sql"]:
         if os.path.exists(f): os.remove(f)
 

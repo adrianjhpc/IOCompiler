@@ -7,6 +7,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 
 using namespace mlir;
 
@@ -337,6 +338,9 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
 // ============================================================================
 // 3. Compute-Bound Block -> Auto-Asynchrony (io_uring / aio)
 // ============================================================================
+
+namespace {
+
 struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, OperationPass<func::FuncOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PromoteToAsyncIOPass)
     StringRef getArgument() const final { return "io-async-promotion"; }
@@ -344,13 +348,125 @@ struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, Operation
 
     void runOnOperation() override {
         func::FuncOp func = getOperation();
-        // TODO: This is an analysis-heavy pass (not a simple pattern match).
-        // 1. Walk the function to find blocking 'read' calls.
-        // 2. Perform Data Dependency Analysis on the read buffer.
-        // 3. Hoist independent compute operations above the first buffer usage.
-        // 4. Replace 'read' with 'io.uring_submit' and inject 'io.uring_wait' right before the buffer is actually used.
+        IRRewriter rewriter(&getContext());
+        
+        // Request MLIR's Alias Analysis for the current function
+        AliasAnalysis &aliasAnalysis = getAnalysis<AliasAnalysis>();
+
+        SmallVector<func::CallOp> readCandidates;
+
+        // 1. Walk the function to find synchronous 'read' calls
+        func.walk([&](func::CallOp callOp) {
+            StringRef callee = callOp.getCallee();
+            if (callee == "read" || callee == "read64") {
+                readCandidates.push_back(callOp);
+            }
+        });
+
+        for (func::CallOp readOp : readCandidates) {
+            if (readOp.getNumOperands() < 3) continue;
+            
+            Value fd = readOp.getOperand(0);
+            Value buffer = readOp.getOperand(1);
+            Value size = readOp.getOperand(2);
+            Value bytesReadResult = readOp.getResult(0);
+
+            Block *block = readOp->getBlock();
+            auto it = Block::iterator(readOp);
+            ++it; // Start scanning immediately *after* the read
+
+            Operation *waitInsertionPoint = nullptr;
+            int independentComputeCount = 0;
+
+            // 2. The Dependency Scanner (Now with Alias Analysis!)
+            while (it != block->end()) {
+                Operation &currentOp = *it;
+                bool isDependent = false;
+
+                // Rule A: Does this operation use the bytes_read integer result directly?
+                for (Value operand : currentOp.getOperands()) {
+                    if (operand == bytesReadResult) {
+                        isDependent = true;
+                        break;
+                    }
+                }
+
+                if (!isDependent) {
+                    // Rule B: Ask AliasAnalysis if this instruction touches our buffer!
+                    // In Async I/O, the Kernel owns the buffer between submit and wait.
+                    // If the CPU tries to Read (Ref) OR Write (Mod) to it, we MUST wait!
+                    ModRefResult modRef = aliasAnalysis.getModRef(&currentOp, buffer);
+                    
+                    if (modRef.isMod() || modRef.isRef()) {
+                        isDependent = true;
+                    }
+                }
+
+                // Rule C: Safely handle control flow boundaries and black boxes
+                if (!isDependent) {
+                    // If it's a terminator (branch, return), we must stop and wait.
+                    // We cannot safely float an async wait into another basic block 
+                    // without advanced control-flow dominance analysis.
+                    if (currentOp.hasTrait<OpTrait::IsTerminator>()) {
+                        isDependent = true;
+                    }
+                    // If it's an opaque function call that might do hidden I/O or state mutation
+                    else if (auto call = dyn_cast<CallOpInterface>(&currentOp)) {
+                        auto memEffects = dyn_cast<MemoryEffectOpInterface>(&currentOp);
+                        // If it doesn't explicitly declare itself free of memory effects, assume it's a hazard.
+                        if (!memEffects || !memEffects.hasNoEffect()) {
+                            isDependent = true;
+                        }
+                    }
+                }
+
+                // We found the hazard! This is where the wait() must go.
+                if (isDependent) {
+                    waitInsertionPoint = &currentOp;
+                    break;
+                }
+
+                independentComputeCount++;
+                ++it;
+            }
+
+            // 3. Evaluate Profitability
+            // We only split the I/O if we actually managed to jump over independent instructions.
+            // (e.g., if independentComputeCount is 0, a synchronous read is faster anyway).
+            if (independentComputeCount > 0 && waitInsertionPoint) {
+                rewriter.setInsertionPoint(readOp);
+
+                // Create the ASYNC SUBMIT call
+                auto submitCall = rewriter.create<func::CallOp>(
+                    readOp.getLoc(),
+                    rewriter.getI32Type(), // Returns an async ticket/token
+                    "io_submit",
+                    ArrayRef<Value>{fd, buffer, size}
+                );
+                Value asyncTicket = submitCall.getResult(0);
+
+                // Move the rewriter down to right before the hazard
+                rewriter.setInsertionPoint(waitInsertionPoint);
+
+                // Create the ASYNC WAIT call
+                auto waitCall = rewriter.create<func::CallOp>(
+                    readOp.getLoc(),
+                    readOp.getResult(0).getType(), // Returns actual bytes read (ssize_t)
+                    "io_wait",
+                    ArrayRef<Value>{asyncTicket}
+                );
+
+                // Swap the synchronous return value for the async wait return value
+                readOp.replaceAllUsesWith(waitCall.getResults());
+                
+                // Erase the old synchronous read
+                rewriter.eraseOp(readOp);
+            }
+        }
     }
 };
+
+} // end anonymous namespace
 
 // ============================================================================
 // 4. Bulk Random Access -> Auto-mmap Promotion
