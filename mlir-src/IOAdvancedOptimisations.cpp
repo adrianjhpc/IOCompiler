@@ -109,15 +109,18 @@ struct PromoteToZeroCopyPattern : public RewritePattern {
         rewriter.setInsertionPoint(writeCall);
         Value nullOffset = readCall.getArgOperands()[1]; 
 
-        auto sendfileCall = rewriter.create<func::CallOp>(
+        auto sendfileOp = mlir::io::SendfileOp::create(
+            rewriter,
             writeCall.getLoc(),
-            "sendfile",
-            readCall->getResultTypes(),
-            ValueRange{fdOut, fdIn, nullOffset, writeSize}
+            readCall->getResult(0).getType(), // Return type (bytes transferred)
+            fdOut,                           // out_fd
+            fdIn,                            // in_fd
+            nullOffset,                      // offset (buffer pointer)
+            writeSize                        // count
         );
 
-        rewriter.replaceOp(writeCall, sendfileCall.getResults());
-        rewriter.replaceOp(readCall, sendfileCall.getResults());
+        rewriter.replaceOp(writeCall, sendfileOp.getBytesWritten());
+        rewriter.replaceOp(readCall, sendfileOp.getBytesWritten());
 
         llvm::errs() << "[IOOpt-Telemetry] SUCCESS: Replaced read/write with sendfile!\n";
         return success();
@@ -128,44 +131,16 @@ struct PromoteToZeroCopyPattern : public RewritePattern {
 struct ZeroCopyPromotionPass : public PassWrapper<ZeroCopyPromotionPass, OperationPass<ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ZeroCopyPromotionPass)
     StringRef getArgument() const final { return "io-zero-copy-promotion"; }
-    StringRef getDescription() const final { return "Promotes read/write pairs to zero-copy sendfile syscalls"; }
+    StringRef getDescription() const final { return "Promotes read/write pairs to zero-copy io.sendfile ops"; }
 
     void getDependentDialects(DialectRegistry &registry) const override {
-        registry.insert<func::FuncDialect>();
+        registry.insert<mlir::io::IODialect>();
     }
 
     void runOnOperation() override {
         ModuleOp module = getOperation();
         MLIRContext *context = &getContext();
 
-        // PRE-PASS: Walk the module sequentially to find a 'read' call.
-        // We will steal its exact ClangIR types so our sendfile signature matches perfectly!
-        CallOpInterface firstRead = nullptr;
-        module.walk([&](CallOpInterface call) {
-            auto callee = dyn_cast<SymbolRefAttr>(call.getCallableForCallee());
-            if (callee && callee.getRootReference() == "read" && call.getArgOperands().size() == 3) {
-                firstRead = call;
-                return WalkResult::interrupt(); // Stop walking, we got what we need!
-            }
-            return WalkResult::advance();
-        });
-
-        // Safely declare 'sendfile' using the stolen types
-        auto sendfileSym = StringAttr::get(context, "sendfile");
-        if (firstRead && !module.lookupSymbol(sendfileSym)) {
-            OpBuilder builder(module.getBodyRegion());
-            
-            // Steal the precise ClangIR types dynamically!
-            Type fdType = firstRead.getArgOperands()[0].getType();
-            Type ptrType = firstRead.getArgOperands()[1].getType(); 
-            Type sizeType = firstRead.getArgOperands()[2].getType();
-            Type retType = firstRead->getResultTypes()[0];
-            
-            auto sendfileType = builder.getFunctionType({fdType, fdType, ptrType, sizeType}, {retType});
-            builder.create<func::FuncOp>(module.getLoc(), "sendfile", sendfileType).setPrivate();
-        }
-
-        // Now run the multithreaded greedy pattern matcher
         RewritePatternSet patterns(context);
         patterns.add<PromoteToZeroCopyPattern>(context);
         

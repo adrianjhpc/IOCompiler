@@ -80,6 +80,23 @@ def IOCastOp : IO_Op<"cast"> {
 }
 
 // ============================================================================
+// Zero-Copy I/O Operations
+// ============================================================================
+def IO_SendfileOp : IO_Op<"sendfile", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Zero-copy data transfer between file descriptors";
+  let description = [{
+    Transfers data directly between two file descriptors entirely within the 
+    kernel space, bypassing the need to copy data to/from user space buffers.
+  }];
+  
+  // Arguments: out_fd, in_fd, offset (ptr), count (size)
+  let arguments = (ins I32:$out_fd, I32:$in_fd, AnyType:$offset, I64:$count);
+  let results = (outs I64:$bytes_written);
+  
+  let assemblyFormat = "$out_fd `,` $in_fd `,` $offset `,` $count attr-dict `:` type($offset)";
+}
+
+// ============================================================================
 // Asynchronous I/O Operations (io_uring / aio)
 // ============================================================================
 def IO_SubmitOp : IO_Op<"submit"> {
