@@ -9,6 +9,8 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 
+#include "IODialect.h"
+
 using namespace mlir;
 
 namespace {
@@ -346,6 +348,10 @@ struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, Operation
     StringRef getArgument() const final { return "io-async-promotion"; }
     StringRef getDescription() const final { return "Software pipelines blocking I/O with independent compute"; }
 
+    void getDependentDialects(DialectRegistry &registry) const override {
+        registry.insert<mlir::io::IODialect>();
+    }
+
     void runOnOperation() override {
         func::FuncOp func = getOperation();
         IRRewriter rewriter(&getContext());
@@ -355,7 +361,7 @@ struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, Operation
 
         SmallVector<func::CallOp> readCandidates;
 
-        // 1. Walk the function to find synchronous 'read' calls
+        // alk the function to find synchronous 'read' calls
         func.walk([&](func::CallOp callOp) {
             StringRef callee = callOp.getCallee();
             if (callee == "read" || callee == "read64") {
@@ -378,7 +384,7 @@ struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, Operation
             Operation *waitInsertionPoint = nullptr;
             int independentComputeCount = 0;
 
-            // 2. The Dependency Scanner (Now with Alias Analysis!)
+            // The Dependency Scanner (Now with Alias Analysis!)
             while (it != block->end()) {
                 Operation &currentOp = *it;
                 bool isDependent = false;
@@ -394,7 +400,7 @@ struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, Operation
                 if (!isDependent) {
                     // Rule B: Ask AliasAnalysis if this instruction touches our buffer!
                     // In Async I/O, the Kernel owns the buffer between submit and wait.
-                    // If the CPU tries to Read (Ref) OR Write (Mod) to it, we MUST wait!
+                    // If the CPU tries to Read (Ref) OR Write (Mod) to it, we must wait.
                     ModRefResult modRef = aliasAnalysis.getModRef(&currentOp, buffer);
                     
                     if (modRef.isMod() || modRef.isRef()) {
@@ -430,34 +436,33 @@ struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, Operation
                 ++it;
             }
 
-            // 3. Evaluate Profitability
+            // Evaluate Profitability
             // We only split the I/O if we actually managed to jump over independent instructions.
             // (e.g., if independentComputeCount is 0, a synchronous read is faster anyway).
             if (independentComputeCount > 0 && waitInsertionPoint) {
                 rewriter.setInsertionPoint(readOp);
 
                 // Create the ASYNC SUBMIT call
-                auto submitCall = rewriter.create<func::CallOp>(
+                auto submitOp = mlir::io::SubmitOp::create(
+                    rewriter, 
                     readOp.getLoc(),
-                    rewriter.getI32Type(), // Returns an async ticket/token
-                    "io_submit",
-                    ArrayRef<Value>{fd, buffer, size}
+                    rewriter.getI32Type(), // Return ticket type
+                    fd, buffer, size
                 );
-                Value asyncTicket = submitCall.getResult(0);
 
                 // Move the rewriter down to right before the hazard
                 rewriter.setInsertionPoint(waitInsertionPoint);
 
                 // Create the ASYNC WAIT call
-                auto waitCall = rewriter.create<func::CallOp>(
+                auto waitOp = mlir::io::WaitOp::create(
+                    rewriter, 
                     readOp.getLoc(),
-                    readOp.getResult(0).getType(), // Returns actual bytes read (ssize_t)
-                    "io_wait",
-                    ArrayRef<Value>{asyncTicket}
+                    readOp.getResult(0).getType(), // Return bytes read
+                    submitOp.getTicket()
                 );
 
                 // Swap the synchronous return value for the async wait return value
-                readOp.replaceAllUsesWith(waitCall.getResults());
+                readOp.replaceAllUsesWith(waitOp->getResults());
                 
                 // Erase the old synchronous read
                 rewriter.eraseOp(readOp);
@@ -492,7 +497,7 @@ struct MmapPromotionPass : public PassWrapper<MmapPromotionPass, OperationPass<f
     void runOnOperation() override {
         RewritePatternSet patterns(&getContext());
         patterns.add<PromoteToMmapPattern>(&getContext());
-        if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))))
+        if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
             signalPassFailure();
     }
 };
@@ -522,7 +527,7 @@ struct PrefetchInjectionPass : public PassWrapper<PrefetchInjectionPass, Operati
     void runOnOperation() override {
         RewritePatternSet patterns(&getContext());
         patterns.add<InjectPrefetchPattern>(&getContext());
-        if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))))
+        if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
             signalPassFailure();
     }
 };

@@ -584,7 +584,7 @@ struct IOLoopBatchingPass : public PassWrapper<IOLoopBatchingPass, OperationPass
     patterns.add<CirLoopBatchingPattern>(context);
 
     // Apply the patterns to the entire module
-    if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
       signalPassFailure();
     }
   }

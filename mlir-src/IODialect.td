@@ -78,3 +78,32 @@ def IOCastOp : IO_Op<"cast"> {
   let arguments = (ins AnyType:$input);
   let results = (outs AnyType:$output);
 }
+
+// ============================================================================
+// Asynchronous I/O Operations (io_uring / aio)
+// ============================================================================
+def IO_SubmitOp : IO_Op<"submit"> {
+  let summary = "Submits an asynchronous I/O operation";
+  let description = [{
+    Registers an I/O operation with the kernel to be executed in the background.
+    Returns an integer 'ticket' that must be passed to an io.wait operation.
+  }];
+  
+  // Matching your IO_ReadOp arguments
+  let arguments = (ins I32:$fd, AnyType:$buffer, I64:$size);
+  let results = (outs I32:$ticket);
+  let assemblyFormat = "$fd `,` $buffer `,` $size attr-dict `:` type($buffer)";
+}
+
+def IO_WaitOp : IO_Op<"wait", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Waits for an asynchronous I/O operation to complete";
+  let description = [{
+    Blocks the current thread until the kernel has finished writing data to 
+    the buffer associated with the given ticket.
+  }];
+  
+  let arguments = (ins I32:$ticket);
+  // Matching your IO_ReadOp results
+  let results = (outs I64:$bytes_read);
+  let assemblyFormat = "$ticket attr-dict";
+}

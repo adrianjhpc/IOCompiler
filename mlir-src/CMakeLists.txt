@@ -102,6 +102,8 @@ mlir_tablegen(IODialect.h.inc -gen-op-decls)
 mlir_tablegen(IODialect.cpp.inc -gen-op-defs)
 mlir_tablegen(IODialectDialect.h.inc -gen-dialect-decls)
 mlir_tablegen(IODialectDialect.cpp.inc -gen-dialect-defs)
+mlir_tablegen(IOOps.h.inc -gen-op-decls)
+mlir_tablegen(IOOps.cpp.inc -gen-op-defs)
 
 add_public_tablegen_target(IODialectIncGen)
 
