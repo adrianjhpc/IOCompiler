@@ -38,6 +38,7 @@ struct RemoveIOCastPass : public mlir::PassWrapper<RemoveIOCastPass, mlir::Opera
 
   void getDependentDialects(mlir::DialectRegistry &registry) const override {
     registry.insert<mlir::LLVM::LLVMDialect>();
+    registry.insert<mlir::arith::ArithDialect>(); // Added for integer fallbacks
   }
 
   void runOnOperation() override {
@@ -45,7 +46,7 @@ struct RemoveIOCastPass : public mlir::PassWrapper<RemoveIOCastPass, mlir::Opera
     std::vector<mlir::Operation*> opsToErase;
 
     getOperation()->walk([&](mlir::Operation *op) {
-      //Fix ClangIR's Opaque Pointer Bug (Delete redundant bitcasts)
+      // Fix ClangIR's Opaque Pointer Bug (Delete redundant bitcasts)
       if (op->getName().getStringRef() == "llvm.bitcast") {
         if (op->getOperand(0).getType() == op->getResult(0).getType()) {
           op->getResult(0).replaceAllUsesWith(op->getOperand(0));
@@ -64,11 +65,21 @@ struct RemoveIOCastPass : public mlir::PassWrapper<RemoveIOCastPass, mlir::Opera
             }
         }
         
-        // If it's a pointer going into an integer array, emit standard LLVM ptrtoint
+        // If types don't match, we must legally convert them before replacing
         if (operand.getType() != result.getType()) {
           builder.setInsertionPoint(op);
+          
           if (mlir::isa<mlir::LLVM::LLVMPointerType>(operand.getType())) {
-            operand = builder.create<mlir::LLVM::PtrToIntOp>(op->getLoc(), result.getType(), operand);
+            operand = mlir::LLVM::PtrToIntOp::create(builder, op->getLoc(), result.getType(), operand);
+          } 
+          else if (operand.getType().isIntOrIndex() && result.getType().isIntOrIndex()) {
+            unsigned inBits = operand.getType().getIntOrFloatBitWidth();
+            unsigned outBits = result.getType().getIntOrFloatBitWidth();
+            if (inBits < outBits) {
+                operand = mlir::arith::ExtUIOp::create(builder, op->getLoc(), result.getType(), operand);
+            } else if (inBits > outBits) {
+                operand = mlir::arith::TruncIOp::create(builder, op->getLoc(), result.getType(), operand);
+            }
           }
         }
         

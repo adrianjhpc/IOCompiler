@@ -10,32 +10,42 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 
+#include "clang/CIR/Dialect/IR/CIRDialect.h"
+#include "clang/CIR/Dialect/IR/CIRAttrs.h"
+
 #include "IODialect.h"
 
 using namespace mlir;
 
 namespace {
 
+static StringRef getCalleeName(CallOpInterface call) {
+    if (auto sym = dyn_cast_or_null<SymbolRefAttr>(call.getCallableForCallee()))
+        return sym.getRootReference().getValue();
+    if (auto attr = call->getAttrOfType<FlatSymbolRefAttr>("callee"))
+        return attr.getValue();
+    return "";
+}
+
 struct PromoteToZeroCopyPattern : public RewritePattern {
     PromoteToZeroCopyPattern(MLIRContext *context)
         : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/2, context) {}
 
-
     LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter) const override {
-        // Use func::CallOp instead of CallOpInterface
-        auto readCall = dyn_cast<func::CallOp>(op);
+        auto readCall = dyn_cast<CallOpInterface>(op);
         if (!readCall) return failure();
 
-        // Use the robust getCallee() string matcher
-        StringRef callee = readCall.getCallee();
+        auto calleeAttr = dyn_cast_or_null<SymbolRefAttr>(readCall.getCallableForCallee());
+        if (!calleeAttr) return failure();
+       
+        StringRef callee = getCalleeName(readCall); 
         if (callee != "read" && callee != "read64" && callee != "read32") return failure();
-        if (readCall.getNumOperands() != 3) return failure();
+        if (readCall->getNumOperands() != 3) return failure();
         
         llvm::errs() << "[IOOpt-Telemetry] Found 'read' call. Scanning block...\n";
         
-        // Use getOperand() instead of getArgOperands()
-        Value fdIn = readCall.getOperand(0);
-        Value readSize = readCall.getOperand(2);
+        Value fdIn = readCall->getOperand(0);
+        Value readSize = readCall->getOperand(2);
 
         // Hardened to trace through array indexing and pointer math
         auto getRootAllocation = [](Value v) {
@@ -49,25 +59,27 @@ struct PromoteToZeroCopyPattern : public RewritePattern {
                 }
             }
             return v;
-        };  
+        };        
 
-        Value readBufferRoot = getRootAllocation(readCall.getOperand(1));
+        Value readBufferRoot = getRootAllocation(readCall->getOperand(1));
 
-        func::CallOp writeCall = nullptr;
+        CallOpInterface writeCall = nullptr; 
         
         for (Operation *nextOp = op->getNextNode(); nextOp != nullptr; nextOp = nextOp->getNextNode()) {
             
-            // Apply the same robust matching to the Write call
-            if (auto maybeWrite = dyn_cast<func::CallOp>(nextOp)) {
-                StringRef nextCallee = maybeWrite.getCallee();
-                if (nextCallee == "write" || nextCallee == "write64" || nextCallee == "write32") {
-                    if (maybeWrite.getNumOperands() == 3) {
-                        Value writeBufferRoot = getRootAllocation(maybeWrite.getOperand(1));
-                        if (readBufferRoot == writeBufferRoot) {
-                            writeCall = maybeWrite;
-                            break; 
-                        } else {
-                            llvm::errs() << "[IOOpt-Telemetry] Abort: Found 'write', but buffer roots mismatch!\n";
+            if (auto maybeWrite = dyn_cast<CallOpInterface>(nextOp)) {
+                auto nextCalleeAttr = dyn_cast_or_null<SymbolRefAttr>(maybeWrite.getCallableForCallee());
+                if (nextCalleeAttr) {
+                    StringRef nextCallee = nextCalleeAttr.getRootReference().getValue();
+                    if (nextCallee == "write" || nextCallee == "write64" || nextCallee == "write32") {
+                        if (maybeWrite->getNumOperands() == 3) {
+                            Value writeBufferRoot = getRootAllocation(maybeWrite->getOperand(1));
+                            if (readBufferRoot == writeBufferRoot) {
+                                writeCall = maybeWrite;
+                                break; 
+                            } else {
+                                llvm::errs() << "[IOOpt-Telemetry] Abort: Found 'write', but buffer roots mismatch!\n";
+                            }
                         }
                     }
                 }
@@ -102,34 +114,63 @@ struct PromoteToZeroCopyPattern : public RewritePattern {
             return failure();
         }
 
-        Value fdOut = writeCall.getOperand(0);
-        Value writeSize = writeCall.getOperand(2);
+        Value fdOut = writeCall->getOperand(0);
+        Value writeSizeOut = writeCall->getOperand(2);
 
-        if (getRootAllocation(readSize) != getRootAllocation(writeSize)) {
+        if (getRootAllocation(readSize) != getRootAllocation(writeSizeOut)) {
             llvm::errs() << "[IOOpt-Telemetry] Abort: Size variables do not match.\n";
             return failure();
         }
 
+        // ==========================================
+        // The Rewrite
+        // ==========================================
         rewriter.setInsertionPoint(writeCall);
-        Value nullOffset = readCall.getOperand(1);
+        Value nullOffset = readCall->getOperand(1); 
+        Location loc = writeCall->getLoc();
 
+        auto i32Ty = rewriter.getI32Type();
+        auto i64Ty = rewriter.getI64Type();
+
+        // Safely cast ClangIR input types to standard MLIR types
+        Value stdFdOut = fdOut;
+        if (stdFdOut.getType() != i32Ty) 
+            stdFdOut = mlir::io::IOCastOp::create(rewriter, loc, i32Ty, stdFdOut);
+            
+        Value stdFdIn = fdIn;
+        if (stdFdIn.getType() != i32Ty) 
+            stdFdIn = mlir::io::IOCastOp::create(rewriter, loc, i32Ty, stdFdIn);
+            
+        Value stdSizeOut = writeSizeOut;
+        if (stdSizeOut.getType() != i64Ty) 
+            stdSizeOut = mlir::io::IOCastOp::create(rewriter, loc, i64Ty, stdSizeOut);
+
+        // Create the Sendfile op with mathematically pure standard types
         auto sendfileOp = mlir::io::SendfileOp::create(
             rewriter,
-            writeCall.getLoc(),
-            readCall->getResult(0).getType(), // Return type (bytes transferred)
-            fdOut,                           // out_fd
-            fdIn,                            // in_fd
-            nullOffset,                      // offset (buffer pointer)
-            writeSize                        // count
+            loc,
+            i64Ty, 
+            stdFdOut,                           
+            stdFdIn,                            
+            nullOffset,                      
+            stdSizeOut                         
         );
 
-        rewriter.replaceOp(writeCall, sendfileOp.getBytesWritten());
-        rewriter.replaceOp(readCall, sendfileOp.getBytesWritten());
+        Value replacement = sendfileOp.getBytesWritten();
+        Type expectedReturnType = readCall->getResult(0).getType();
+
+        // Bridge the return value back to ClangIR
+        if (replacement.getType() != expectedReturnType) {
+            replacement = mlir::io::IOCastOp::create(rewriter, loc, expectedReturnType, replacement);
+        }
+
+        // Complete the replacements
+        rewriter.replaceOp(writeCall, replacement);
+        rewriter.replaceOp(readCall, replacement);
 
         llvm::errs() << "[IOOpt-Telemetry] SUCCESS: Replaced read/write with sendfile!\n";
         return success();
     }
-
 };
 
 struct ZeroCopyPromotionPass : public PassWrapper<ZeroCopyPromotionPass, OperationPass<ModuleOp>> {
@@ -170,14 +211,17 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
         ModuleOp module = getOperation();
 
         // --------------------------------------------------------------------
-        // Step 1: PRE-PASS (Steal types and inject ioopt_writev_* intrinsics)
+        // Step 1: PRE-PASS
         // --------------------------------------------------------------------
-        func::CallOp firstWrite = nullptr;
-        module.walk([&](func::CallOp call) {
-            StringRef callee = call.getCallee();
-            if ((callee == "write" || callee == "write64" || callee == "write32") && call.getNumOperands() == 3) {
-                firstWrite = call;
-                return WalkResult::interrupt();
+        CallOpInterface firstWrite = nullptr;
+        module.walk([&](CallOpInterface call) {
+            auto calleeAttr = dyn_cast_or_null<SymbolRefAttr>(call.getCallableForCallee());
+            if (calleeAttr) {
+                StringRef callee = getCalleeName(call);
+                if ((callee == "write" || callee == "write64" || callee == "write32") && call->getNumOperands() == 3) {
+                    firstWrite = call;
+                    return WalkResult::interrupt();
+                }
             }
             return WalkResult::advance();
         });
@@ -185,11 +229,11 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
         if (!firstWrite) return;
 
         OpBuilder builder(module.getBodyRegion());
-        Type fdType = firstWrite.getOperand(0).getType();
-        Type ptrType = firstWrite.getOperand(1).getType(); 
-        Type sizeType = firstWrite.getOperand(2).getType();
-        Type retType = firstWrite->getResultTypes()[0];       
- 
+        Type fdType = firstWrite->getOperand(0).getType();
+        Type ptrType = firstWrite->getOperand(1).getType(); 
+        Type sizeType = firstWrite->getOperand(2).getType();
+        Type retType = firstWrite->getResult(0).getType();
+        
         for (int i = 2; i <= 4; ++i) {
             std::string funcName = "ioopt_writev_" + std::to_string(i);
             if (!module.lookupSymbol(funcName)) {
@@ -207,14 +251,12 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
         // --------------------------------------------------------------------
         // Step 2: DETERMINISTIC TOP-DOWN WALK
         // --------------------------------------------------------------------
-        // We bypass the greedy pattern rewriter entirely to guarantee order.
         SmallVector<SmallVector<Operation*, 4>> allBatches;
 
         module.walk([&](Block *block) {
             SmallVector<Operation*, 4> currentBatch;
             Value currentFdRoot = nullptr;
 
-            // Our trusty SSA Root Tracer
             auto getRootAllocation = [](Value v) {
                 while (Operation *def = v.getDefiningOp()) {
                     StringRef name = def->getName().getStringRef();
@@ -231,70 +273,66 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
             for (Operation &opRef : *block) {
                 Operation *op = &opRef;
                 
-                // If we find a write, check if we can add it to the current batch
-                if (auto call = dyn_cast<func::CallOp>(op)) {
-                    StringRef callee = call.getCallee();
-                    if ((callee == "write" || callee == "write64" || callee == "write32") && call.getNumOperands() == 3) {
-                        Value fdRoot = getRootAllocation(call.getOperand(0));
- 
-                        if (currentBatch.empty()) {
-                            currentBatch.push_back(op);
-                            currentFdRoot = fdRoot;
-                        } else if (fdRoot == currentFdRoot) {
-                            currentBatch.push_back(op);
-                            if (currentBatch.size() == 4) { // Cap at 4 for intrinsic chunking
-                                allBatches.push_back(currentBatch);
+                if (auto call = dyn_cast<CallOpInterface>(op)) {
+                    auto calleeAttr = dyn_cast_or_null<SymbolRefAttr>(call.getCallableForCallee());
+                    if (calleeAttr) {
+                       StringRef callee = getCalleeName(call); 
+                       if ((callee == "write" || callee == "write64" || callee == "write32") && call->getNumOperands() == 3) {
+                            Value fdRoot = getRootAllocation(call->getOperand(0));
+                            
+                            if (currentBatch.empty()) {
+                                currentBatch.push_back(op);
+                                currentFdRoot = fdRoot;
+                            } else if (fdRoot == currentFdRoot) {
+                                currentBatch.push_back(op);
+                                if (currentBatch.size() == 4) { 
+                                    allBatches.push_back(currentBatch);
+                                    currentBatch.clear();
+                                    currentFdRoot = nullptr;
+                                }
+                            } else {
+                                if (currentBatch.size() >= 2) allBatches.push_back(currentBatch);
                                 currentBatch.clear();
-                                currentFdRoot = nullptr;
+                                currentBatch.push_back(op);
+                                currentFdRoot = fdRoot;
                             }
-                        } else {
-                            // Hit a write to a DIFFERENT file. Save old batch, start new one.
-                            if (currentBatch.size() >= 2) allBatches.push_back(currentBatch);
-                            currentBatch.clear();
-                            currentBatch.push_back(op);
-                            currentFdRoot = fdRoot;
+                            continue;
                         }
-                        continue;
                     }
                 }
 
                 StringRef opName = op->getName().getStringRef();
                 
-                // Safe memory preparation instructions (ignore them)
                 if (opName == "cir.load" || opName == "cir.cast" || 
                     opName == "cir.get_element" || opName == "cir.ptr_stride" ||
                     opName == "cir.const") {
                     continue;
                 }
 
-                // HAZARD DETECTED: Bank the current batch and reset!
                 if (currentBatch.size() >= 2) allBatches.push_back(currentBatch);
                 currentBatch.clear();
                 currentFdRoot = nullptr;
             }
             
-            // End of the block: Bank any remaining writes
             if (currentBatch.size() >= 2) allBatches.push_back(currentBatch);
         });
 
         // --------------------------------------------------------------------
         // Step 3: APPLY THE REPLACEMENTS
         // --------------------------------------------------------------------
-        // We do this AFTER the walk to avoid crashing the block iterator!
         for (auto &batch : allBatches) {
-            // Insert exactly where the last write was
             OpBuilder replaceBuilder(batch.back()); 
             std::string funcName = "ioopt_writev_" + std::to_string(batch.size());
             
             SmallVector<Value, 9> newArgs;
-            auto firstWriteInBatch = cast<func::CallOp>(batch[0]);
+            auto firstWriteInBatch = cast<CallOpInterface>(batch[0]);
             
-            newArgs.push_back(firstWriteInBatch.getOperand(0)); // Shared FD
+            newArgs.push_back(firstWriteInBatch->getOperand(0)); // Shared FD
             
             for (Operation *w : batch) {
-                auto wCall = cast<func::CallOp>(w);
-                newArgs.push_back(wCall.getOperand(1)); // Buffer
-                newArgs.push_back(wCall.getOperand(2)); // Size
+                auto wCall = cast<CallOpInterface>(w);
+                newArgs.push_back(wCall->getOperand(1)); // Buffer
+                newArgs.push_back(wCall->getOperand(2)); // Size
             }
 
             auto writevCall = func::CallOp::create(
@@ -305,7 +343,6 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
                 newArgs
             );
 
-            // Replace all original writes with the new writev call
             for (Operation *w : batch) {
                 w->replaceAllUsesWith(writevCall.getResults());
                 w->erase();
@@ -313,349 +350,313 @@ struct BlockVectoredIOPass : public PassWrapper<BlockVectoredIOPass, OperationPa
             
             llvm::errs() << "[IOOpt-Vectored] SUCCESS: Merged " << batch.size() << " writes into " << funcName << "!\n";
         }
-    }
+    } 
 };
 
 // ============================================================================
 // 3. Compute-Bound Block -> Auto-Asynchrony (io_uring / aio)
 // ============================================================================
-
-namespace {
-
-struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, OperationPass<func::FuncOp>> {
+struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, OperationPass<ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PromoteToAsyncIOPass)
     StringRef getArgument() const final { return "io-async-promotion"; }
     StringRef getDescription() const final { return "Software pipelines blocking I/O with independent compute"; }
 
     void getDependentDialects(DialectRegistry &registry) const override {
-        registry.insert<mlir::io::IODialect>();
+        registry.insert<mlir::io::IODialect, cir::CIRDialect>();
     }
 
     void runOnOperation() override {
-        func::FuncOp func = getOperation();
+        ModuleOp module = getOperation();
         IRRewriter rewriter(&getContext());
-        
-        // Request MLIR's Alias Analysis for the current function
-        AliasAnalysis &aliasAnalysis = getAnalysis<AliasAnalysis>();
 
-        SmallVector<func::CallOp> readCandidates;
+        SmallVector<CallOpInterface> readCandidates;
 
-        // alk the function to find synchronous 'read' calls
-        func.walk([&](func::CallOp callOp) {
-            StringRef callee = callOp.getCallee();
+        module.walk([&](CallOpInterface callOp) {
+            StringRef callee = getCalleeName(callOp);
             if (callee == "read" || callee == "read64" || callee == "read32") {
                 readCandidates.push_back(callOp);
             }
         });
 
-        for (func::CallOp readOp : readCandidates) {
-            if (readOp.getNumOperands() < 3) continue;
+        for (CallOpInterface readOp : readCandidates) {
+            if (readOp->getNumOperands() < 3) continue;
             
-            Value fd = readOp.getOperand(0);
-            Value buffer = readOp.getOperand(1);
-            Value size = readOp.getOperand(2);
-            Value bytesReadResult = readOp.getResult(0);
+            Value fd = readOp->getOperand(0);
+            Value buffer = readOp->getOperand(1);
+            Value size = readOp->getOperand(2);
+            Value bytesReadResult = readOp->getResult(0);
 
             Block *block = readOp->getBlock();
-            auto it = Block::iterator(readOp);
-            ++it; // Start scanning immediately *after* the read
+            auto it = Block::iterator(readOp.getOperation());
+            ++it; 
 
             Operation *waitInsertionPoint = nullptr;
             int independentComputeCount = 0;
 
-            // The Dependency Scanner (Now with Alias Analysis!)
+            // Safe backward tracer for ClangIR memory tracking
+            auto getRoot = [&](Value v) {
+                while (auto def = v.getDefiningOp()) {
+                    StringRef n = def->getName().getStringRef();
+                    if (n == "cir.cast" || n == "cir.load" || n == "cir.ptr_stride" || n == "cir.get_element") {
+                        v = def->getOperand(0);
+                    } else break;
+                }
+                return v;
+            };
+            Value rootBuf = getRoot(buffer);
+
             while (it != block->end()) {
                 Operation &currentOp = *it;
                 bool isDependent = false;
 
-                // Rule A: Does this operation use the bytes_read integer result directly?
+                // Safely check if the instruction touches the buffer or the read result
                 for (Value operand : currentOp.getOperands()) {
-                    if (operand == bytesReadResult) {
+                    if (operand == bytesReadResult || getRoot(operand) == rootBuf) {
                         isDependent = true;
                         break;
                     }
                 }
 
                 if (!isDependent) {
-                    // Rule B: Ask AliasAnalysis if this instruction touches our buffer!
-                    // In Async I/O, the Kernel owns the buffer between submit and wait.
-                    // If the CPU tries to Read (Ref) OR Write (Mod) to it, we must wait.
-                    ModRefResult modRef = aliasAnalysis.getModRef(&currentOp, buffer);
-                    
-                    if (modRef.isMod() || modRef.isRef()) {
-                        isDependent = true;
-                    }
-                }
-
-                // Rule C: Safely handle control flow boundaries and black boxes
-                if (!isDependent) {
-                    // If it's a terminator (branch, return), we must stop and wait.
-                    // We cannot safely float an async wait into another basic block 
-                    // without advanced control-flow dominance analysis.
-                    if (currentOp.hasTrait<OpTrait::IsTerminator>()) {
-                        isDependent = true;
-                    }
-                    // If it's an opaque function call that might do hidden I/O or state mutation
-                    else if (auto call = dyn_cast<CallOpInterface>(&currentOp)) {
+                    if (currentOp.hasTrait<OpTrait::IsTerminator>()) isDependent = true;
+                    else if (isa<CallOpInterface>(&currentOp)) {
                         auto memEffects = dyn_cast<MemoryEffectOpInterface>(&currentOp);
-                        // If it doesn't explicitly declare itself free of memory effects, assume it's a hazard.
-                        if (!memEffects || !memEffects.hasNoEffect()) {
-                            isDependent = true;
-                        }
+                        if (!memEffects || !memEffects.hasNoEffect()) isDependent = true;
                     }
                 }
 
-                // We found the hazard! This is where the wait() must go.
                 if (isDependent) {
                     waitInsertionPoint = &currentOp;
                     break;
                 }
 
-                independentComputeCount++;
+                StringRef opName = currentOp.getName().getStringRef();
+                if (opName.starts_with("cir.binop") || opName.starts_with("arith.")) {
+                    independentComputeCount++;
+                }
+                
                 ++it;
             }
 
-            // Evaluate Profitability
-            // We only split the I/O if we actually managed to jump over independent instructions.
-            // (e.g., if independentComputeCount is 0, a synchronous read is faster anyway).
             if (independentComputeCount > 0 && waitInsertionPoint) {
                 rewriter.setInsertionPoint(readOp);
+                Location loc = readOp->getLoc();
 
-                // Create the ASYNC SUBMIT call
-                auto submitOp = mlir::io::SubmitOp::create(
-                    rewriter, 
-                    readOp.getLoc(),
-                    rewriter.getI32Type(), // Return ticket type
-                    fd, buffer, size
-                );
+                auto i32Ty = rewriter.getI32Type();
+                auto i64Ty = rewriter.getI64Type();
 
-                // Move the rewriter down to right before the hazard
+                Value stdFd = fd;
+                if (stdFd.getType() != i32Ty) stdFd = rewriter.create<mlir::io::IOCastOp>(loc, i32Ty, stdFd);
+                Value stdSize = size;
+                if (stdSize.getType() != i64Ty) stdSize = rewriter.create<mlir::io::IOCastOp>(loc, i64Ty, stdSize);
+
+                auto submitOp = rewriter.create<mlir::io::SubmitOp>(loc, i32Ty, stdFd, buffer, stdSize);
+
                 rewriter.setInsertionPoint(waitInsertionPoint);
+                auto waitOp = rewriter.create<mlir::io::WaitOp>(loc, i64Ty, submitOp.getTicket());
 
-                // Create the ASYNC WAIT call
-                auto waitOp = mlir::io::WaitOp::create(
-                    rewriter, 
-                    readOp.getLoc(),
-                    readOp.getResult(0).getType(), // Return bytes read
-                    submitOp.getTicket()
-                );
+                Value waitResult = waitOp.getBytesRead();
+                Type expectedReturnType = readOp->getResult(0).getType();
+                if (waitResult.getType() != expectedReturnType) {
+                    waitResult = rewriter.create<mlir::io::IOCastOp>(loc, expectedReturnType, waitResult);
+                }
 
-                // Swap the synchronous return value for the async wait return value
-                readOp.replaceAllUsesWith(waitOp->getResults());
-                
-                // Erase the old synchronous read
+                readOp->replaceAllUsesWith(ValueRange{waitResult});
                 rewriter.eraseOp(readOp);
+                
+                llvm::errs() << "[IOOpt-Telemetry] SUCCESS: Promoted read to async submit/wait!\n";
             }
         }
     }
 };
-
-} // end anonymous namespace
 
 // ============================================================================
 // 4. Bulk Random Access -> Auto-mmap Promotion
 // ============================================================================
-struct PromoteToMmapPattern : public RewritePattern {
-    PromoteToMmapPattern(MLIRContext *context)
-        : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/10, context) {}
-
-    LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter) const override {
-        Value fd, buffer, size;
-        
-        // 1. Find a read operation
-        if (auto readOp = dyn_cast<mlir::io::ReadOp>(op)) {
-            fd = readOp.getFd();
-            buffer = readOp.getOperand(1);
-            size = readOp.getSize();
-        }
-
-        else if (auto callOp = dyn_cast<func::CallOp>(op)) {
-            StringRef callee = callOp.getCallee(); 
-            if (callee == "read" || callee == "read64" || callee == "read32") {
-                if (callOp.getNumOperands() != 3) return failure();
-                fd = callOp.getOperand(0);
-                buffer = callOp.getOperand(1);
-                size = callOp.getOperand(2);
-            } else {
-                return failure();
-            }
-        }
-        else {
-            return failure();
-        }
-
-        // 2. Trace the buffer pointer back to its allocation source
-        Operation *allocOp = buffer.getDefiningOp();
-        if (!allocOp) return failure();
-
-        Value allocSize;
-        if (auto callAlloc = dyn_cast<func::CallOp>(allocOp)) {
-            StringRef callee = callAlloc.getCallee();
-            if ((callee == "malloc" || callee == "malloc32") && callAlloc.getNumOperands() == 1) {
-                allocSize = callAlloc.getOperand(0);
-            } else {
-                return failure();
-            }
-        }
-
-        // 3. Profitability & Safety Check
-        // allocSize and size are SSA Values. This strictly ensures the program 
-        // used the exact same dynamic variable for both the malloc and the read.
-        if (allocSize != size) {
-            return failure(); 
-        }
-
-        // 4. The Rewrite
-        rewriter.setInsertionPoint(allocOp);
-        Location loc = allocOp->getLoc();
-
-        Value zeroOffset = arith::ConstantOp::create(rewriter, loc, rewriter.getI64IntegerAttr(0));
-
-        Value sizeI64 = size;
-        if (!sizeI64.getType().isInteger(64)) {
-            sizeI64 = arith::ExtUIOp::create(rewriter, loc, rewriter.getI64Type(), size);
-        }
-
-        auto mmapOp = mlir::io::MmapOp::create(
-            rewriter,
-            loc,
-            buffer.getType(), 
-            fd,
-            sizeI64, 
-            zeroOffset
-        );
-
-        // Replace all downstream uses of the malloc'd buffer with the mmap'd buffer
-        rewriter.replaceOp(allocOp, mmapOp.getBuffer());
-        
-        Value replacementResult = size;
-        Type expectedReturnType = op->getResult(0).getType();
-        
-        if (replacementResult.getType() != expectedReturnType) {
-            if (replacementResult.getType().getIntOrFloatBitWidth() < expectedReturnType.getIntOrFloatBitWidth()) {
-                replacementResult = arith::ExtUIOp::create(rewriter, loc, expectedReturnType, replacementResult);
-            } else {
-                replacementResult = arith::TruncIOp::create(rewriter, loc, expectedReturnType, replacementResult);
-            }
-        }
-
-        rewriter.replaceOp(op, replacementResult); 
-
-        llvm::errs() << "[IOOpt-Telemetry] SUCCESS: Promoted malloc+read to io.mmap!\n";
-        return success();
-    }
-};
-
-struct MmapPromotionPass : public PassWrapper<MmapPromotionPass, OperationPass<func::FuncOp>> {
+struct MmapPromotionPass : public PassWrapper<MmapPromotionPass, OperationPass<ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MmapPromotionPass)
     StringRef getArgument() const final { return "io-mmap-promotion"; }
     StringRef getDescription() const final { return "Promotes bulk file reads into memory mapped (mmap) buffers"; }
 
-    // CRITICAL: Declare dependencies on io and arith dialects!
     void getDependentDialects(DialectRegistry &registry) const override {
-        registry.insert<mlir::io::IODialect, mlir::arith::ArithDialect>();
+        registry.insert<mlir::io::IODialect, mlir::arith::ArithDialect, cir::CIRDialect>();
     }
 
     void runOnOperation() override {
-        RewritePatternSet patterns(&getContext());
-        patterns.add<PromoteToMmapPattern>(&getContext());
-        if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
-            signalPassFailure();
-    }
-};
+        ModuleOp module = getOperation();
+        IRRewriter rewriter(&getContext());
+        SmallVector<Operation*, 4> opsToErase; 
 
-struct InjectPrefetchPattern : public OpRewritePattern<scf::ForOp> {
-    InjectPrefetchPattern(MLIRContext *context)
-        : OpRewritePattern<scf::ForOp>(context, /*benefit=*/1) {}
+        auto safeCast = [&](Value v, Type targetTy, Location loc) -> Value {
+            if (v.getType() == targetTy) return v;
+            if (v.getType().isIntOrIndex() && targetTy.isIntOrIndex()) {
+                unsigned inBits = v.getType().getIntOrFloatBitWidth();
+                unsigned outBits = targetTy.getIntOrFloatBitWidth();
+                if (inBits < outBits) return rewriter.create<arith::ExtUIOp>(loc, targetTy, v);
+                if (inBits > outBits) return rewriter.create<arith::TruncIOp>(loc, targetTy, v);
+            }
+            return mlir::io::IOCastOp::create(rewriter, loc, targetTy, v);
+        };
 
-    LogicalResult matchAndRewrite(scf::ForOp forOp, PatternRewriter &rewriter) const override {
-        Value fdToPrefetch;
-        Value sizeToPrefetch;
-        Operation *readInsertionPoint = nullptr;
-        
-        bool alreadyPrefetched = false;
-        int computeInstructionCount = 0;
+        module.walk([&](CallOpInterface allocCall) {
+            StringRef allocName = getCalleeName(allocCall);
+            if (allocName != "malloc" && allocName != "malloc32") return;
 
-        // 1. Scan the inside of the loop
-        forOp.walk([&](Operation *op) {
-            // Guard against infinite loops
-            if (isa<mlir::io::PrefetchOp>(op)) {
-                alreadyPrefetched = true;
-            } 
-            else if (auto readOp = dyn_cast<mlir::io::ReadOp>(op)) {
-                if (!readInsertionPoint) {
-                    fdToPrefetch = readOp.getFd();
-                    sizeToPrefetch = readOp.getSize();
-                    readInsertionPoint = op;
-                }
-            } 
-            else if (auto callOp = dyn_cast<func::CallOp>(op)) {
-                StringRef callee = callOp.getCallee(); 
-                // Fix: StringRef is an object, not a pointer. Use the == operator!
-                if (callee == "read" || callee == "read64" || callee == "read32") {
-                    if (!readInsertionPoint && callOp.getNumOperands() == 3) {
-                        fdToPrefetch = callOp.getOperand(0);
-                        sizeToPrefetch = callOp.getOperand(2);
-                        readInsertionPoint = op;
+            Value allocSize = allocCall->getOperand(0);
+            Value allocResult = allocCall->getResult(0);
+
+            CallOpInterface targetRead = nullptr;
+            for (Operation *op = allocCall->getNextNode(); op != nullptr; op = op->getNextNode()) {
+                if (auto readCall = dyn_cast<CallOpInterface>(op)) {
+                    StringRef readName = getCalleeName(readCall);
+                    if (readName == "read" || readName == "read64" || readName == "read32") {
+                        targetRead = readCall;
+                        break;
                     }
                 }
-            } 
-            else if (!isa<scf::YieldOp>(op) && !isa<scf::ForOp>(op)) {
-                computeInstructionCount++;
-            }
-        });
-
-        if (!readInsertionPoint) return failure(); 
-        if (alreadyPrefetched) return failure();   
-        if (computeInstructionCount < 10) return failure(); 
-
-        // 2. Mutate the loop safely using the new MLIR 22 API
-        rewriter.modifyOpInPlace(forOp, [&]() {
-            rewriter.setInsertionPoint(readInsertionPoint);
-            Location loc = readInsertionPoint->getLoc();
-
-            // Mathematically Safe Type Alignment for the math operations
-            Value sizeI64 = sizeToPrefetch;
-            if (!sizeI64.getType().isInteger(64)) {
-                sizeI64 = arith::ExtUIOp::create(rewriter, loc, rewriter.getI64Type(), sizeToPrefetch);
             }
 
-            // Calculate Lookahead (size * 4) using the modern static create methods
-            Value four = arith::ConstantOp::create(rewriter, loc, rewriter.getI64IntegerAttr(4));
-            Value lookaheadSize = arith::MulIOp::create(rewriter, loc, sizeI64, four);
+            if (!targetRead) return;
 
-            mlir::io::PrefetchOp::create(
-                rewriter,
-                loc,
-                fdToPrefetch,
-                lookaheadSize
-            );
+            auto getRootAllocation = [](Value v) {
+                while (Operation *def = v.getDefiningOp()) {
+                    StringRef name = def->getName().getStringRef();
+                    if (name == "cir.cast" || name == "cir.load" || name == "cir.ptr_stride" || name == "cir.get_element") {
+                        v = def->getOperand(0);
+                    } else break;
+                }
+                return v;
+            };
+
+            bool bufferMatches = false;
+            Value readRoot = getRootAllocation(targetRead->getOperand(1));
             
-            llvm::errs() << "[IOOpt-Telemetry] SUCCESS: Injected io.prefetch ahead of loop read!\n";
+            if (readRoot == allocResult) {
+                bufferMatches = true; // Standard MLIR direct connection
+            } else {
+                // ClangIR connection: Check if malloc was stored into the read's alloca
+                for (Operation *op = allocCall->getNextNode(); op != targetRead; op = op->getNextNode()) {
+                    StringRef opName = op->getName().getStringRef();
+                    if (opName == "cir.store" || opName == "memref.store") {
+                        if (getRootAllocation(op->getOperand(0)) == allocResult && op->getOperand(1) == readRoot) {
+                            bufferMatches = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (bufferMatches && getRootAllocation(allocSize) == getRootAllocation(targetRead->getOperand(2))) {
+                rewriter.setInsertionPoint(allocCall);
+                Location loc = allocCall->getLoc();
+
+                auto i32Ty = rewriter.getI32Type();
+                auto i64Ty = rewriter.getI64Type();
+                
+                Value zeroOffset = arith::ConstantOp::create(rewriter, loc, rewriter.getI64IntegerAttr(0));
+                Value stdSize = safeCast(allocSize, i64Ty, loc);
+
+                Value stdFd = targetRead->getOperand(0);
+                if (auto loadOp = stdFd.getDefiningOp()) {
+                    if (loadOp->getName().getStringRef() == "cir.load" || loadOp->getName().getStringRef() == "memref.load") {
+                        stdFd = rewriter.clone(*loadOp)->getResult(0);
+                    }
+                }
+                stdFd = safeCast(stdFd, i32Ty, loc);
+
+                auto mmapOp = mlir::io::MmapOp::create(rewriter, loc, allocResult.getType(), stdFd, stdSize, zeroOffset);
+                rewriter.replaceOp(allocCall, mmapOp.getBuffer());
+
+                rewriter.setInsertionPoint(targetRead);
+                Value replacementResult = safeCast(allocSize, targetRead->getResult(0).getType(), targetRead->getLoc());
+
+                targetRead->replaceAllUsesWith(ValueRange{replacementResult});
+                opsToErase.push_back(targetRead);
+
+                llvm::errs() << "[IOOpt-Telemetry] SUCCESS: Promoted malloc+read to io.mmap!\n";
+            }
         });
 
-        return success();
+        for (auto op : opsToErase) op->erase();
     }
 };
 
-struct PrefetchInjectionPass : public PassWrapper<PrefetchInjectionPass, OperationPass<func::FuncOp>> {
+// ============================================================================
+// 5. Compute-Heavy Loops -> Prefetch Injection
+// ============================================================================
+struct PrefetchInjectionPass : public PassWrapper<PrefetchInjectionPass, OperationPass<ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PrefetchInjectionPass)
     StringRef getArgument() const final { return "io-prefetch-injection"; }
     StringRef getDescription() const final { return "Injects kernel read-ahead hints into compute-heavy sequential I/O loops"; }
 
-    // CRITICAL: We are generating new operations from the 'io' and 'arith' dialects.
-    // We must declare them here so MLIR loads them into the context!
     void getDependentDialects(DialectRegistry &registry) const override {
-        registry.insert<mlir::io::IODialect, mlir::arith::ArithDialect>();
+        registry.insert<mlir::io::IODialect, mlir::arith::ArithDialect, cir::CIRDialect, scf::SCFDialect>();
     }
 
     void runOnOperation() override {
-        RewritePatternSet patterns(&getContext());
-        patterns.add<InjectPrefetchPattern>(&getContext());
-        
-        // Using the modern applyPatternsGreedily!
-        if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
-            signalPassFailure();
+        ModuleOp module = getOperation();
+        IRRewriter rewriter(&getContext());
+
+        auto safeCast = [&](Value v, Type targetTy, Location loc) -> Value {
+            if (v.getType() == targetTy) return v;
+            if (v.getType().isIntOrIndex() && targetTy.isIntOrIndex()) {
+                unsigned inBits = v.getType().getIntOrFloatBitWidth();
+                unsigned outBits = targetTy.getIntOrFloatBitWidth();
+                if (inBits < outBits) return rewriter.create<arith::ExtUIOp>(loc, targetTy, v);
+                if (inBits > outBits) return rewriter.create<arith::TruncIOp>(loc, targetTy, v);
+            }
+            return mlir::io::IOCastOp::create(rewriter, loc, targetTy, v);
+        };
+
+        auto injectPrefetch = [&](Operation *loopOp) {
+            Value fdToPrefetch;
+            Value sizeToPrefetch;
+            Operation *readInsertionPoint = nullptr;
+            
+            bool alreadyPrefetched = false;
+            int computeInstructionCount = 0;
+
+            loopOp->walk([&](Operation *op) {
+                if (isa<mlir::io::PrefetchOp>(op)) {
+                    alreadyPrefetched = true;
+                } 
+                else if (auto callOp = dyn_cast<CallOpInterface>(op)) {
+                    StringRef callee = getCalleeName(callOp); 
+                    if (callee == "read" || callee == "read64" || callee == "read32") {
+                        if (!readInsertionPoint && callOp->getNumOperands() == 3) {
+                            fdToPrefetch = callOp->getOperand(0);
+                            sizeToPrefetch = callOp->getOperand(2);
+                            readInsertionPoint = op;
+                        }
+                    }
+                } 
+                else {
+                    StringRef opName = op->getName().getStringRef();
+                    if (opName.starts_with("cir.binop") || opName.starts_with("arith.")) {
+                        computeInstructionCount++;
+                    }
+                }
+            });
+
+            if (!readInsertionPoint || alreadyPrefetched || computeInstructionCount < 5) return; 
+
+            rewriter.setInsertionPoint(loopOp);
+            Value four = arith::ConstantOp::create(rewriter, loopOp->getLoc(), rewriter.getI64IntegerAttr(4));
+
+            // Move insertion point back inside the loop for the rest of the operations
+            rewriter.setInsertionPoint(readInsertionPoint);
+            Location loc = readInsertionPoint->getLoc();
+
+            Value stdFd = safeCast(fdToPrefetch, rewriter.getI32Type(), loc);
+            Value sizeI64 = safeCast(sizeToPrefetch, rewriter.getI64Type(), loc);
+            Value lookaheadSize = arith::MulIOp::create(rewriter, loc, sizeI64, four);
+
+            mlir::io::PrefetchOp::create(rewriter, loc, stdFd, lookaheadSize);
+            llvm::errs() << "[IOOpt-Telemetry] SUCCESS: Injected io.prefetch ahead of loop read!\n";
+        };
+
+        module.walk([&](cir::ForOp op) { injectPrefetch(op); });
+        module.walk([&](scf::ForOp op) { injectPrefetch(op); });
     }
 };
 
@@ -673,5 +674,5 @@ namespace io {
         PassRegistration<MmapPromotionPass>();
         PassRegistration<PrefetchInjectionPass>();
     }
-} // namespace io
-} // namespace mlir
+} 
+}

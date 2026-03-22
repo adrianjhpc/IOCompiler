@@ -404,11 +404,7 @@ struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
 };
 
 struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
-  AliasAnalysis &aliasAnalysis;
-
-  // Constructor takes the AliasAnalysis engine from the Pass Manager
-  HoistReadLoopPattern(MLIRContext *context, AliasAnalysis &aa)
-      : OpRewritePattern<scf::ForOp>(context), aliasAnalysis(aa) {}
+  using OpRewritePattern<scf::ForOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(scf::ForOp loop, PatternRewriter &rewriter) const override {
     Block *body = loop.getBody();
@@ -426,6 +422,9 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
     }
     if (!readOp || !loop.isDefinedOutsideOfLoop(readOp.getFd())) return failure();
 
+    // This guarantees the analysis is perfectly synchronized with the current IR state.
+    AliasAnalysis aliasAnalysis(loop);
+
     // Hazard checking
     for (Operation &op : *body) {
       if (isa<scf::YieldOp, io::ReadOp>(op)) continue;
@@ -439,19 +438,16 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
         for (auto &effect : effects) {
           Value writtenVal = effect.getValue();
           if (writtenVal) {
-            // Ask MLIR's Alias Analysis if the written memory overlaps with our read buffer
+            // Ask our fresh Alias Analysis if the memory overlaps
             AliasResult aliasResult = aliasAnalysis.alias(readOp.getBuffer(), writtenVal);
             if (!aliasResult.isNo()) {
-              // It's a MayAlias or MustAlias. We cannot safely hoist
               return failure(); 
             }
           } else {
-            // Opaque memory write (e.g., an external function call). Unsafe to hoist.
             return failure();
           }
         }
       } else if (!isMemoryEffectFree(&op)) {
-         // Catch-all for operations that lack specific memory interfaces but aren't pure
          return failure();
       }
     }
@@ -466,19 +462,15 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
     // Contiguous vs Vector Routing
     Value basePointer;
     if (isContiguousMemoryAccess(readOp.getBuffer(), loop, readOp.getSize(), basePointer)) {
-        // Fast contigious read
         Value totalSize = rewriter.create<arith::MulIOp>(loc, tripCountI64, readOp.getSize());
         rewriter.create<io::BatchReadOp>(loc, rewriter.getI64Type(), readOp.getFd(), basePointer, totalSize);
     } else {
-        // Gather (readv)
         auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, readOp.getBuffer().getType());
         auto sizeArrayType = MemRefType::get({ShapedType::kDynamic}, rewriter.getI64Type());
 
         Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, tripCount);
         Value sizesMemref = rewriter.create<memref::AllocaOp>(loc, sizeArrayType, tripCount);
 
-
-        // Build an address-calculation loop before the main loop
         auto calcLoop = rewriter.create<scf::ForOp>(loc, loop.getLowerBound(), loop.getUpperBound(), loop.getStep());
         rewriter.setInsertionPointToStart(calcLoop.getBody());
 
@@ -487,7 +479,6 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
         Value arrayIdx = rewriter.create<arith::DivSIOp>(loc, ivOffset, loop.getStep());
         Value arrayIdxCast = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), arrayIdx);
 
-        // Clone only the pure address/math calculations
         IRMapping mapping;
         mapping.map(loop.getInductionVar(), currentIV);
         for (Operation &op : *body) {
@@ -503,14 +494,10 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
         rewriter.create<memref::StoreOp>(loc, mappedBuffer, ptrsMemref, arrayIdxCast);
         rewriter.create<memref::StoreOp>(loc, mappedSize, sizesMemref, arrayIdxCast);
 
-        // Emit the batched gather operation immediately after our calculation loop
         rewriter.setInsertionPoint(loop); 
         rewriter.create<io::BatchReadVOp>(loc, rewriter.getI64Type(), readOp.getFd(), ptrsMemref, sizesMemref, tripCount);
     }
 
-    // Clean up the original loop
-    // Replace the slow I/O calls inside the loop with just the expected byte count,
-    // leaving the processing logic completely intact to run against the now-populated memory
     rewriter.modifyOpInPlace(loop, [&]() {
         rewriter.setInsertionPoint(readOp);
         rewriter.replaceOp(readOp, readOp.getSize());
@@ -548,7 +535,7 @@ struct StripCIRAttrsPass : public PassWrapper<StripCIRAttrsPass, OperationPass<M
         }
       }
       
-      // Remove them cleanly using the MLIR API (No more broken commas!)
+      // Remove them cleanly using the MLIR API
       for (StringAttr attrName : attrsToRemove) {
         op->removeAttr(attrName);
       }
@@ -556,7 +543,6 @@ struct StripCIRAttrsPass : public PassWrapper<StripCIRAttrsPass, OperationPass<M
   }
 };
 
-// Look closely at this top line: it MUST say OperationPass<ModuleOp>
 struct IOLoopBatchingPass : public PassWrapper<IOLoopBatchingPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(IOLoopBatchingPass)
 
@@ -572,19 +558,15 @@ struct IOLoopBatchingPass : public PassWrapper<IOLoopBatchingPass, OperationPass
   void runOnOperation() override {
     llvm::errs() << "\n[IOOpt] ---> Pass activated on Module! <__-\n";
 
-    // Because the class inherits from OperationPass<ModuleOp>, 
-    // getOperation() will now legally return a ModuleOp!
     ModuleOp module = getOperation();
 
     mlir::io::bootstrapTargetInfo(module);
 
     MLIRContext *context = &getContext();
 
-    AliasAnalysis &aliasAnalysis = getAnalysis<AliasAnalysis>();
-
     RewritePatternSet patterns(context);
     patterns.add<HoistWriteLoopPattern>(context);
-    patterns.add<HoistReadLoopPattern>(context, aliasAnalysis);
+    patterns.add<HoistReadLoopPattern>(context);
     patterns.add<CirLoopBatchingPattern>(context);
 
     // Apply the patterns to the entire module

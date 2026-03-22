@@ -1,6 +1,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Interfaces/CallInterfaces.h" // NEEDED for CallOpInterface
 #include "mlir/Pass/Pass.h"
 
 #include "IODialect.h"
@@ -10,67 +11,59 @@ using namespace mlir;
 
 namespace {
 
-// Pattern to lift `write(fd, buf, count)`
-struct LiftWritePattern : public OpRewritePattern<func::CallOp> {
-  using OpRewritePattern<func::CallOp>::OpRewritePattern;
+// Pattern to lift `write(fd, buf, count)` across ANY dialect (func or cir)
+struct LiftWritePattern : public OpInterfaceRewritePattern<CallOpInterface> {
+  using OpInterfaceRewritePattern<CallOpInterface>::OpInterfaceRewritePattern;
 
-  LogicalResult matchAndRewrite(func::CallOp callOp, PatternRewriter &rewriter) const override {
-    // Check if the function being called is named "write"
-    auto calleeAttr = callOp.getCalleeAttr();
+  LogicalResult matchAndRewrite(CallOpInterface callOp, PatternRewriter &rewriter) const override {
+    auto calleeAttr = dyn_cast_or_null<SymbolRefAttr>(callOp.getCallableForCallee());
     if (!calleeAttr) return failure();
-    if (calleeAttr.getValue() != "write") return failure();
+    
+    StringRef callee = calleeAttr.getRootReference().getValue();
+    if (callee != "write" && callee != "write32" && callee != "write64") return failure();
 
-    // Ensure it matches the POSIX signature: ssize_t write(int fd, const void *buf, size_t count);
-    if (callOp.getNumOperands() != 3) return failure();
-    if (callOp.getNumResults() != 1) return failure(); // Expecting a return value (bytes written)
+    if (callOp.getArgOperands().size() != 3) return failure();
+    if (callOp->getNumResults() != 1) return failure(); 
 
-    Value fd = callOp.getOperand(0);
-    Value buf = callOp.getOperand(1);
-    Value count = callOp.getOperand(2);
+    Value fd = callOp.getArgOperands()[0];
+    Value buf = callOp.getArgOperands()[1];
+    Value count = callOp.getArgOperands()[2];
 
-    // Upgrade to our custom dialect
-    auto ioWrite = io::WriteOp::create(
-        rewriter,
-        callOp.getLoc(),
-        callOp.getResultTypes().front(), // Maintain the original return type (usually i64)
-        fd,
-        buf,
-        count
+    // The cleanest, most modern way to replace an operation in MLIR
+    rewriter.replaceOpWithNewOp<io::WriteOp>(
+        callOp,
+        callOp->getResult(0).getType(), 
+        fd, buf, count
     );
 
-
-    // Replace the generic call with our semantic operation
-    rewriter.replaceOp(callOp, ioWrite.getResult());
     return success();
   }
 };
 
-// Pattern to lift `read(fd, buf, count)`
-struct LiftReadPattern : public OpRewritePattern<func::CallOp> {
-  using OpRewritePattern<func::CallOp>::OpRewritePattern;
+// Pattern to lift `read(fd, buf, count)` across ANY dialect (func or cir)
+struct LiftReadPattern : public OpInterfaceRewritePattern<CallOpInterface> {
+  using OpInterfaceRewritePattern<CallOpInterface>::OpInterfaceRewritePattern;
 
-  LogicalResult matchAndRewrite(func::CallOp callOp, PatternRewriter &rewriter) const override {
-    auto calleeAttr = callOp.getCalleeAttr();
+  LogicalResult matchAndRewrite(CallOpInterface callOp, PatternRewriter &rewriter) const override {
+    auto calleeAttr = dyn_cast_or_null<SymbolRefAttr>(callOp.getCallableForCallee());
     if (!calleeAttr) return failure();
-    if (calleeAttr.getValue() != "read") return failure();
+    
+    StringRef callee = calleeAttr.getRootReference().getValue();
+    if (callee != "read" && callee != "read32" && callee != "read64") return failure();
 
-    if (callOp.getNumOperands() != 3) return failure();
-    if (callOp.getNumResults() != 1) return failure(); 
+    if (callOp.getArgOperands().size() != 3) return failure();
+    if (callOp->getNumResults() != 1) return failure(); 
 
-    Value fd = callOp.getOperand(0);
-    Value buf = callOp.getOperand(1);
-    Value count = callOp.getOperand(2);
+    Value fd = callOp.getArgOperands()[0];
+    Value buf = callOp.getArgOperands()[1];
+    Value count = callOp.getArgOperands()[2];
 
-    auto ioRead = io::ReadOp::create(
-        rewriter,
-        callOp.getLoc(),
-        callOp.getResultTypes().front(), 
-        fd,
-        buf,
-        count
+    rewriter.replaceOpWithNewOp<io::ReadOp>(
+        callOp,
+        callOp->getResult(0).getType(), 
+        fd, buf, count
     );
 
-    rewriter.replaceOp(callOp, ioRead.getResult());
     return success();
   }
 };
@@ -95,7 +88,6 @@ struct RecogniseIOPass : public PassWrapper<RecogniseIOPass, OperationPass<Modul
     patterns.add<LiftWritePattern>(context);
     patterns.add<LiftReadPattern>(context);
     
-    // Apply the lifting patterns module-wide
     if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
       signalPassFailure();
     }

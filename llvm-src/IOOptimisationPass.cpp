@@ -299,8 +299,9 @@ namespace {
 
       for (BasicBlock &BB : *F) {
           for (Instruction &I : BB) {
-              // Dealbreaker 1: Volatile memory (Locks, Atomics, Memory Barriers)
-              if (I.isVolatile()) return false;
+              if (auto *LI = dyn_cast<LoadInst>(&I)) { if (LI->isVolatile()) return false; }
+              else if (auto *SI = dyn_cast<StoreInst>(&I)) { if (SI->isVolatile()) return false; }
+              else if (auto *MI = dyn_cast<MemIntrinsic>(&I)) { if (MI->isVolatile()) return false; }
 
               // Dealbreaker 2: Calls to unknown functions or known I/O
               if (auto *Call = dyn_cast<CallInst>(&I)) {
@@ -349,12 +350,13 @@ namespace {
     if (!DT.dominates(LastCall, NewCall)) return false;
 
     if (isReadBatch) {
-        if (NewArgs.Length) {
-            if (auto *Inst = dyn_cast<Instruction>(NewArgs.Length)) {
-                if (!DT.dominates(Inst, Batch.front())) return false;
-            }
+    if (NewArgs.Length) {
+        if (auto *Inst = dyn_cast<Instruction>(NewArgs.Length)) {
+            if (!DT.dominates(Inst, Batch.front())) return false;
         }
     }
+}
+   
 
     if (LastCallee != NewCallee) return false;
 
@@ -636,7 +638,7 @@ namespace {
     return IOPattern::Unprofitable;
   }
 
-  bool flushBatch(SmallVectorImpl<CallInst*> &Batch, Module *M, ScalarEvolution &SE) {
+  bool flushBatch(SmallVectorImpl<CallInst*> &Batch, Module *M, ScalarEvolution &SE, DominatorTree *DT = nullptr) { 
     if (Batch.empty()) return false;
 
     const DataLayout &DL = M->getDataLayout();
@@ -813,10 +815,16 @@ namespace {
         Value *IovPtr = InsertBuilder.CreateInBoundsGEP(IovArrayTy, IovArray, {InsertBuilder.getInt32(0), InsertBuilder.getInt32(i)});
         
         Value *SafeBufPtr = Args.Buffer;
+
+        if (DT && isa<Instruction>(SafeBufPtr) && !DT->dominates(cast<Instruction>(SafeBufPtr), InsertPt)) {
+            SCEVExpander Expander(SE, DL, "io.vectored.expander");
+            SafeBufPtr = Expander.expandCodeFor(SE.getSCEV(SafeBufPtr), SafeBufPtr->getType(), InsertPt);
+        }
+
         if (SafeBufPtr->getType() != PtrTy && SafeBufPtr->getType()->isPointerTy()) {
             SafeBufPtr = InsertBuilder.CreatePointerBitCastOrAddrSpaceCast(SafeBufPtr, PtrTy);
-        }
-        
+        }       
+ 
         InsertBuilder.CreateStore(SafeBufPtr, InsertBuilder.CreateStructGEP(IovecTy, IovPtr, 0));
         InsertBuilder.CreateStore(InsertBuilder.CreateIntCast(Args.Length, SizeTy, false), InsertBuilder.CreateStructGEP(IovecTy, IovPtr, 1));
       }
@@ -979,8 +987,13 @@ namespace {
               Instruction *InsertionPoint = isRead ? HoistPreheader->getTerminator() : &*HoistExitBB->getFirstInsertionPt();
               IRBuilder<> Builder(InsertionPoint);
               
-              Value *TotalLenVal = Expander.expandCodeFor(TotalBytesSCEV, Args.Length->getType(), InsertionPoint);
-              
+              // 1. Safely expand using the exact type the SCEV was built with
+              Value *TotalLenVal = Expander.expandCodeFor(TotalBytesSCEV, IntPtrTy, InsertionPoint);
+
+              if (TotalLenVal->getType() != Args.Length->getType()) {
+                TotalLenVal = Builder.CreateIntCast(TotalLenVal, Args.Length->getType(), false);
+              }             
+ 
               SmallVector<Value *, 8> NewArgs; 
               if (Args.Type == IOArgs::C_FWRITE || Args.Type == IOArgs::C_FREAD) {
                 NewArgs = {BasePointer, ExtraArg, TotalLenVal, Args.Target};
@@ -1034,7 +1047,7 @@ namespace {
 
       auto flushAllBatches = [&]() {
           for (auto &Pair : ActiveBatches) {
-              if (flushBatch(Pair.second, F.getParent(), SE)) Changed = true;
+              if (flushBatch(Pair.second, F.getParent(), SE, &DT)) Changed = true;
           }
           ActiveBatches.clear();
           ActiveBatchBytes.clear();
@@ -1053,7 +1066,7 @@ namespace {
                     Value *SyncTarget = Call->getArgOperand(0);
                     Value *BaseFD = getBaseFD(SyncTarget);
                     if (ActiveBatches.count(BaseFD) && !ActiveBatches[BaseFD].empty()) {
-                        if (flushBatch(ActiveBatches[BaseFD], F.getParent(), SE)) Changed = true;
+                        if (flushBatch(ActiveBatches[BaseFD], F.getParent(), SE, &DT)) Changed = true;
                         ActiveBatchBytes[BaseFD] = 0;
                     }
                 }
@@ -1088,7 +1101,7 @@ namespace {
                 IOArgs BatchArgs = getIOArguments(Batch.front());
                 bool BatchIsRead = (BatchArgs.Type == IOArgs::POSIX_READ || BatchArgs.Type == IOArgs::C_FREAD || BatchArgs.Type == IOArgs::POSIX_PREAD || BatchArgs.Type == IOArgs::MPI_READ_AT || BatchArgs.Type == IOArgs::CXX_READ);
                 if (BatchIsRead != isRead) {
-                  if (flushBatch(Batch, F.getParent(), SE)) Changed = true;
+                  if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
                   ActiveBatchBytes[BaseFD] = 0;
                 }
               }
@@ -1098,11 +1111,11 @@ namespace {
                 ActiveBatchBytes[BaseFD] += CallBytes;
 
                 if (ActiveBatchBytes[BaseFD] >= Config.HighWaterMark) {
-                  if (flushBatch(Batch, F.getParent(), SE)) Changed = true;
+                  if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
                   ActiveBatchBytes[BaseFD] = 0;
                 }
               } else {
-                if (flushBatch(Batch, F.getParent(), SE)) Changed = true;
+                if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
                 Batch.push_back(Call);
                 ActiveBatchBytes[BaseFD] = CallBytes; 
               }

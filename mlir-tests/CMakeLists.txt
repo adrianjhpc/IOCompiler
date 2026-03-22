@@ -25,3 +25,30 @@ add_test(NAME VectoredTest
 set_tests_properties(AutoZeroCopyTest PROPERTIES TIMEOUT 10)
 
 
+add_test(NAME AsyncTest
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/run_async_test.sh
+            ${CLANG_EXE}
+            $<TARGET_FILE:io-opt>
+            ${CMAKE_CURRENT_SOURCE_DIR}/async_test.c
+)
+
+set_tests_properties(AsyncTest PROPERTIES TIMEOUT 10)
+
+add_test(NAME MMapTest
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/run_mmap_test.sh
+            ${CLANG_EXE}
+            $<TARGET_FILE:io-opt>
+            ${CMAKE_CURRENT_SOURCE_DIR}/mmap_test.c
+)
+
+set_tests_properties(MMapTest PROPERTIES TIMEOUT 10)
+
+add_test(NAME PrefetchTest
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/run_prefetch_test.sh
+            ${CLANG_EXE}
+            $<TARGET_FILE:io-opt>
+            ${CMAKE_CURRENT_SOURCE_DIR}/prefetch_test.c
+)
+
+set_tests_properties(PrefetchTest PROPERTIES TIMEOUT 10)
+
