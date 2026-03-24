@@ -137,6 +137,7 @@ target_link_libraries(MLIRIOOptimiser PRIVATE
   MLIRCallInterfaces
   MLIRAnalysis
   MLIRMlirOptMain
+  MLIRDLTIDialect
   ${MLIRCIR_LIB}
   ${MLIRCIR_INTERFACES_LIB}
   ${CLANGAST_LIB}
@@ -188,5 +189,6 @@ target_link_libraries(io-opt PRIVATE
     MLIRCallInterfaces
     MLIRAnalysis
     MLIRMlirOptMain
+    MLIRDLTIDialect
     ${LLVM_CORE_DEPS}
 )

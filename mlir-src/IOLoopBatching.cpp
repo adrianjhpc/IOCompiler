@@ -253,7 +253,7 @@ struct CirLoopBatchingPattern : public OpRewritePattern<cir::ForOp> {
     rewriter.setInsertionPoint(forOp);
 
     auto ctx = rewriter.getContext();
-    Value tripCountVal = rewriter.create<arith::ConstantIndexOp>(loc, (int64_t)tripCount);
+    Value tripCountVal = arith::ConstantIndexOp::create(rewriter, loc, (int64_t)tripCount);
 
     auto stdI32Ty = rewriter.getI32Type();
     auto stdI64Ty = rewriter.getI64Type();
@@ -262,18 +262,18 @@ struct CirLoopBatchingPattern : public OpRewritePattern<cir::ForOp> {
     auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, stdI64Ty);
     auto sizeArrayType = MemRefType::get({ShapedType::kDynamic}, stdI64Ty);
 
-    Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, ValueRange{tripCountVal});
-    Value sizesMemref = rewriter.create<memref::AllocaOp>(loc, sizeArrayType, ValueRange{tripCountVal});
+    Value ptrsMemref = memref::AllocaOp::create(rewriter, loc, ptrArrayType, ValueRange{tripCountVal});
+    Value sizesMemref = memref::AllocaOp::create(rewriter, loc, sizeArrayType, ValueRange{tripCountVal});
 
     // Allocate the index tracker
     auto idxArrayType = MemRefType::get({1}, rewriter.getIndexType());
-    Value idxAlloca = rewriter.create<memref::AllocaOp>(loc, idxArrayType);
-    Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, (int64_t)0);
-    rewriter.create<memref::StoreOp>(loc, zeroIdx, idxAlloca, ValueRange{zeroIdx});
+    Value idxAlloca = memref::AllocaOp::create(rewriter, loc, idxArrayType);
+    Value zeroIdx = arith::ConstantIndexOp::create(rewriter, loc, (int64_t)0);
+    memref::StoreOp::create(rewriter, loc, zeroIdx, idxAlloca, ValueRange{zeroIdx});
 
-    // Allocate a 1-element stash to smuggle the FD out of the loop!
+    // Allocate a 1-element stash to smuggle the FD out of the loop
     auto fdStashType = MemRefType::get({1}, stdI32Ty);
-    Value fdStash = rewriter.create<memref::AllocaOp>(loc, fdStashType);
+    Value fdStash = memref::AllocaOp::create(rewriter, loc, fdStashType);
 
     // --- PHASE 2: INSIDE THE LOOP ---
     rewriter.modifyOpInPlace(forOp, [&]() {
@@ -283,22 +283,22 @@ struct CirLoopBatchingPattern : public OpRewritePattern<cir::ForOp> {
         Value bufArg = ioCall.getOperand(1);
         Value lenArg = ioCall.getOperand(2);
 
-        Value stdFd = rewriter.create<io::IOCastOp>(loc, stdI32Ty, fdArg);
-        Value stdBuf = rewriter.create<io::IOCastOp>(loc, stdI64Ty, bufArg);
-        Value stdLen = rewriter.create<io::IOCastOp>(loc, stdI64Ty, lenArg);
+        Value stdFd = io::IOCastOp::create(rewriter, loc, stdI32Ty, fdArg);
+        Value stdBuf = io::IOCastOp::create(rewriter, loc, stdI64Ty, bufArg);
+        Value stdLen = io::IOCastOp::create(rewriter, loc, stdI64Ty, lenArg);
 
         // Store FD in our stash
-        rewriter.create<memref::StoreOp>(loc, stdFd, fdStash, ValueRange{zeroIdx});
+        memref::StoreOp::create(rewriter, loc, stdFd, fdStash, ValueRange{zeroIdx});
 
         // Store buffer and length into our arrays
-        Value currentIdx = rewriter.create<memref::LoadOp>(loc, idxAlloca, ValueRange{zeroIdx});
-        rewriter.create<memref::StoreOp>(loc, stdBuf, ptrsMemref, ValueRange{currentIdx});
-        rewriter.create<memref::StoreOp>(loc, stdLen, sizesMemref, ValueRange{currentIdx});
+        Value currentIdx = memref::LoadOp::create(rewriter, loc, idxAlloca, ValueRange{zeroIdx});
+        memref::StoreOp::create(rewriter, loc, stdBuf, ptrsMemref, ValueRange{currentIdx});
+        memref::StoreOp::create(rewriter, loc, stdLen, sizesMemref, ValueRange{currentIdx});
 
         // Increment index
-        Value oneIdx = rewriter.create<arith::ConstantIndexOp>(loc, (int64_t)1);
-        Value nextIdx = rewriter.create<arith::AddIOp>(loc, currentIdx, oneIdx);
-        rewriter.create<memref::StoreOp>(loc, nextIdx, idxAlloca, ValueRange{zeroIdx});
+        Value oneIdx = arith::ConstantIndexOp::create(rewriter, loc, (int64_t)1);
+        Value nextIdx = arith::AddIOp::create(rewriter, loc, currentIdx, oneIdx);
+        memref::StoreOp::create(rewriter, loc, nextIdx, idxAlloca, ValueRange{zeroIdx});
 
         // Delete the original write
         rewriter.eraseOp(ioCall);
@@ -308,13 +308,13 @@ struct CirLoopBatchingPattern : public OpRewritePattern<cir::ForOp> {
     rewriter.setInsertionPointAfter(forOp);
 
     // Retrieve the smuggled FD
-    Value finalFd = rewriter.create<memref::LoadOp>(loc, fdStash, ValueRange{zeroIdx});
+    Value finalFd = memref::LoadOp::create(rewriter, loc, fdStash, ValueRange{zeroIdx});
 
     if (isRead) {
-        rewriter.create<io::BatchReadVOp>(loc, stdI64Ty, finalFd, ptrsMemref, sizesMemref, tripCountVal);
+        io::BatchReadVOp::create(rewriter, loc, stdI64Ty, finalFd, ptrsMemref, sizesMemref, tripCountVal);
         llvm::errs() << "[IOOpt] AMAZING SUCCESS: Loop optimized to BatchReadVOp!\n";
     } else {
-        rewriter.create<io::BatchWriteVOp>(loc, stdI64Ty, finalFd, ptrsMemref, sizesMemref, tripCountVal);
+        io::BatchWriteVOp::create(rewriter, loc, stdI64Ty, finalFd, ptrsMemref, sizesMemref, tripCountVal);
         llvm::errs() << "[IOOpt] AMAZING SUCCESS: Loop optimized to BatchWriteVOp!\n";
     }
 
@@ -348,9 +348,9 @@ struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
     if (!loop.isDefinedOutsideOfLoop(writeOp.getFd())) return failure();
 
     Location loc = loop.getLoc();
-    Value diff = rewriter.create<arith::SubIOp>(loc, loop.getUpperBound(), loop.getLowerBound());
-    Value tripCount = rewriter.create<arith::DivSIOp>(loc, diff, loop.getStep());
-    Value tripCountI64 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), tripCount);
+    Value diff = arith::SubIOp::create(rewriter, loc, loop.getUpperBound(), loop.getLowerBound());
+    Value tripCount = arith::DivSIOp::create(rewriter, loc, diff, loop.getStep());
+    Value tripCountI64 = arith::IndexCastOp::create(rewriter, loc, rewriter.getI64Type(), tripCount);
 
     rewriter.setInsertionPoint(loop);
 
@@ -358,24 +358,24 @@ struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
     Value basePointer;
     if (isContiguousMemoryAccess(writeOp.getBuffer(), loop, writeOp.getSize(), basePointer)) {
         // Contigious writes
-        Value totalSize = rewriter.create<arith::MulIOp>(loc, tripCountI64, writeOp.getSize());
-        rewriter.create<io::BatchWriteOp>(loc, rewriter.getI64Type(), writeOp.getFd(), basePointer, totalSize);
+        Value totalSize = arith::MulIOp::create(rewriter, loc, tripCountI64, writeOp.getSize());
+        io::BatchWriteOp::create(rewriter, loc, rewriter.getI64Type(), writeOp.getFd(), basePointer, totalSize);
     } else {
         // Fallback to scattered writes (writev) 
         auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, writeOp.getBuffer().getType());
         auto sizeArrayType = MemRefType::get({ShapedType::kDynamic}, rewriter.getI64Type());
         
-        Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, tripCount);
-        Value sizesMemref = rewriter.create<memref::AllocaOp>(loc, sizeArrayType, tripCount);
+        Value ptrsMemref = memref::AllocaOp::create(rewriter, loc, ptrArrayType, tripCount);
+        Value sizesMemref = memref::AllocaOp::create(rewriter, loc, sizeArrayType, tripCount);
 
         // Build a new loop just to calculate the addresses
-        auto calcLoop = rewriter.create<scf::ForOp>(loc, loop.getLowerBound(), loop.getUpperBound(), loop.getStep());
+        auto calcLoop = scf::ForOp::create(rewriter, loc, loop.getLowerBound(), loop.getUpperBound(), loop.getStep());
         rewriter.setInsertionPointToStart(calcLoop.getBody());
 
         Value currentIV = calcLoop.getInductionVar();
-        Value ivOffset = rewriter.create<arith::SubIOp>(loc, currentIV, loop.getLowerBound());
-        Value arrayIdx = rewriter.create<arith::DivSIOp>(loc, ivOffset, loop.getStep());
-        Value arrayIdxCast = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), arrayIdx);
+        Value ivOffset = arith::SubIOp::create(rewriter, loc, currentIV, loop.getLowerBound());
+        Value arrayIdx = arith::DivSIOp::create(rewriter, loc, ivOffset, loop.getStep());
+        Value arrayIdxCast = arith::IndexCastOp::create(rewriter, loc, rewriter.getIndexType(), arrayIdx);
 
         // Clone the address calculations
         IRMapping mapping;
@@ -388,12 +388,12 @@ struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
         Value mappedBuffer = mapping.lookupOrDefault(writeOp.getBuffer());
         Value mappedSize = mapping.lookupOrDefault(writeOp.getSize());
         
-        rewriter.create<memref::StoreOp>(loc, mappedBuffer, ptrsMemref, arrayIdxCast);
-        rewriter.create<memref::StoreOp>(loc, mappedSize, sizesMemref, arrayIdxCast);
+        memref::StoreOp::create(rewriter, loc, mappedBuffer, ptrsMemref, arrayIdxCast);
+        memref::StoreOp::create(rewriter, loc, mappedSize, sizesMemref, arrayIdxCast);
 
         // Emit the batched scatter operation after the calculation loop
         rewriter.setInsertionPointAfter(calcLoop);
-        rewriter.create<io::BatchWriteVOp>(loc, rewriter.getI64Type(), writeOp.getFd(), ptrsMemref, sizesMemref, tripCount);
+        io::BatchWriteVOp::create(rewriter, loc, rewriter.getI64Type(), writeOp.getFd(), ptrsMemref, sizesMemref, tripCount);
     }
 
     // Completely erase the original write loop
@@ -453,31 +453,31 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
     }
 
     Location loc = loop.getLoc();
-    Value diff = rewriter.create<arith::SubIOp>(loc, loop.getUpperBound(), loop.getLowerBound());
-    Value tripCount = rewriter.create<arith::DivSIOp>(loc, diff, loop.getStep());
-    Value tripCountI64 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), tripCount);
+    Value diff = arith::SubIOp::create(rewriter, loc, loop.getUpperBound(), loop.getLowerBound());
+    Value tripCount = arith::DivSIOp::create(rewriter, loc, diff, loop.getStep());
+    Value tripCountI64 = arith::IndexCastOp::create(rewriter, loc, rewriter.getI64Type(), tripCount);
 
     rewriter.setInsertionPoint(loop);
 
     // Contiguous vs Vector Routing
     Value basePointer;
     if (isContiguousMemoryAccess(readOp.getBuffer(), loop, readOp.getSize(), basePointer)) {
-        Value totalSize = rewriter.create<arith::MulIOp>(loc, tripCountI64, readOp.getSize());
-        rewriter.create<io::BatchReadOp>(loc, rewriter.getI64Type(), readOp.getFd(), basePointer, totalSize);
+        Value totalSize = arith::MulIOp::create(rewriter, loc, tripCountI64, readOp.getSize());
+        io::BatchReadOp::create(rewriter, loc, rewriter.getI64Type(), readOp.getFd(), basePointer, totalSize);
     } else {
         auto ptrArrayType = MemRefType::get({ShapedType::kDynamic}, readOp.getBuffer().getType());
         auto sizeArrayType = MemRefType::get({ShapedType::kDynamic}, rewriter.getI64Type());
 
-        Value ptrsMemref = rewriter.create<memref::AllocaOp>(loc, ptrArrayType, tripCount);
-        Value sizesMemref = rewriter.create<memref::AllocaOp>(loc, sizeArrayType, tripCount);
+        Value ptrsMemref = memref::AllocaOp::create(rewriter, loc, ptrArrayType, tripCount);
+        Value sizesMemref = memref::AllocaOp::create(rewriter, loc, sizeArrayType, tripCount);
 
-        auto calcLoop = rewriter.create<scf::ForOp>(loc, loop.getLowerBound(), loop.getUpperBound(), loop.getStep());
+        auto calcLoop = scf::ForOp::create(rewriter, loc, loop.getLowerBound(), loop.getUpperBound(), loop.getStep());
         rewriter.setInsertionPointToStart(calcLoop.getBody());
 
         Value currentIV = calcLoop.getInductionVar();
-        Value ivOffset = rewriter.create<arith::SubIOp>(loc, currentIV, loop.getLowerBound());
-        Value arrayIdx = rewriter.create<arith::DivSIOp>(loc, ivOffset, loop.getStep());
-        Value arrayIdxCast = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), arrayIdx);
+        Value ivOffset = arith::SubIOp::create(rewriter, loc, currentIV, loop.getLowerBound());
+        Value arrayIdx = arith::DivSIOp::create(rewriter, loc, ivOffset, loop.getStep());
+        Value arrayIdxCast = arith::IndexCastOp::create(rewriter, loc, rewriter.getIndexType(), arrayIdx);
 
         IRMapping mapping;
         mapping.map(loop.getInductionVar(), currentIV);
@@ -491,11 +491,11 @@ struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
         Value mappedBuffer = mapping.lookupOrDefault(readOp.getBuffer());
         Value mappedSize = mapping.lookupOrDefault(readOp.getSize());
         
-        rewriter.create<memref::StoreOp>(loc, mappedBuffer, ptrsMemref, arrayIdxCast);
-        rewriter.create<memref::StoreOp>(loc, mappedSize, sizesMemref, arrayIdxCast);
+        memref::StoreOp::create(rewriter, loc, mappedBuffer, ptrsMemref, arrayIdxCast);
+        memref::StoreOp::create(rewriter, loc, mappedSize, sizesMemref, arrayIdxCast);
 
         rewriter.setInsertionPoint(loop); 
-        rewriter.create<io::BatchReadVOp>(loc, rewriter.getI64Type(), readOp.getFd(), ptrsMemref, sizesMemref, tripCount);
+        io::BatchReadVOp::create(rewriter, loc, rewriter.getI64Type(), readOp.getFd(), ptrsMemref, sizesMemref, tripCount);
     }
 
     rewriter.modifyOpInPlace(loop, [&]() {

@@ -446,19 +446,19 @@ struct PromoteToAsyncIOPass : public PassWrapper<PromoteToAsyncIOPass, Operation
                 auto i64Ty = rewriter.getI64Type();
 
                 Value stdFd = fd;
-                if (stdFd.getType() != i32Ty) stdFd = rewriter.create<mlir::io::IOCastOp>(loc, i32Ty, stdFd);
+                if (stdFd.getType() != i32Ty) stdFd = mlir::io::IOCastOp::create(rewriter, loc, i32Ty, stdFd);
                 Value stdSize = size;
-                if (stdSize.getType() != i64Ty) stdSize = rewriter.create<mlir::io::IOCastOp>(loc, i64Ty, stdSize);
+                if (stdSize.getType() != i64Ty) stdSize = mlir::io::IOCastOp::create(rewriter, loc, i64Ty, stdSize);
 
-                auto submitOp = rewriter.create<mlir::io::SubmitOp>(loc, i32Ty, stdFd, buffer, stdSize);
+                auto submitOp = mlir::io::SubmitOp::create(rewriter, loc, i32Ty, stdFd, buffer, stdSize);
 
                 rewriter.setInsertionPoint(waitInsertionPoint);
-                auto waitOp = rewriter.create<mlir::io::WaitOp>(loc, i64Ty, submitOp.getTicket());
+                auto waitOp = mlir::io::WaitOp::create(rewriter, loc, i64Ty, submitOp.getTicket());
 
                 Value waitResult = waitOp.getBytesRead();
                 Type expectedReturnType = readOp->getResult(0).getType();
                 if (waitResult.getType() != expectedReturnType) {
-                    waitResult = rewriter.create<mlir::io::IOCastOp>(loc, expectedReturnType, waitResult);
+                    waitResult = mlir::io::IOCastOp::create(rewriter, loc, expectedReturnType, waitResult);
                 }
 
                 readOp->replaceAllUsesWith(ValueRange{waitResult});
@@ -492,8 +492,8 @@ struct MmapPromotionPass : public PassWrapper<MmapPromotionPass, OperationPass<M
             if (v.getType().isIntOrIndex() && targetTy.isIntOrIndex()) {
                 unsigned inBits = v.getType().getIntOrFloatBitWidth();
                 unsigned outBits = targetTy.getIntOrFloatBitWidth();
-                if (inBits < outBits) return rewriter.create<arith::ExtUIOp>(loc, targetTy, v);
-                if (inBits > outBits) return rewriter.create<arith::TruncIOp>(loc, targetTy, v);
+                if (inBits < outBits) return arith::ExtUIOp::create(rewriter, loc, targetTy, v);
+                if (inBits > outBits) return arith::TruncIOp::create(rewriter, loc, targetTy, v);
             }
             return mlir::io::IOCastOp::create(rewriter, loc, targetTy, v);
         };
@@ -602,8 +602,8 @@ struct PrefetchInjectionPass : public PassWrapper<PrefetchInjectionPass, Operati
             if (v.getType().isIntOrIndex() && targetTy.isIntOrIndex()) {
                 unsigned inBits = v.getType().getIntOrFloatBitWidth();
                 unsigned outBits = targetTy.getIntOrFloatBitWidth();
-                if (inBits < outBits) return rewriter.create<arith::ExtUIOp>(loc, targetTy, v);
-                if (inBits > outBits) return rewriter.create<arith::TruncIOp>(loc, targetTy, v);
+                if (inBits < outBits) return arith::ExtUIOp::create(rewriter, loc, targetTy, v);
+                if (inBits > outBits) return arith::TruncIOp::create(rewriter, loc, targetTy, v);
             }
             return mlir::io::IOCastOp::create(rewriter, loc, targetTy, v);
         };

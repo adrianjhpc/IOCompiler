@@ -100,28 +100,35 @@ def compile_to_bitcode(source_file, output_bc, target_triple, flags, disable_mli
             
     except Exception as e:
         print(f"[Warning] Failed to run MLIR Sanitizer on {cir_mlir_file}: {e}")  
-  
+
     # 2. Build the End-to-End MLIR pipeline
     io_opt_cmd = [
         IO_OPT, cir_mlir_file,
         "--allow-unregistered-dialect",
+        
+        # --- ENABLE YOUR CUSTOM OPTIMIZATIONS ---
         "--io-zero-copy-promotion",
         "--io-block-vectored",
-        "--io-loop-batching", 
-        "--cir-to-llvm-inhouse",
-        "--convert-io-to-llvm",
-        "--convert-scf-to-cf",
-        "--convert-cf-to-llvm",
-        "--convert-arith-to-llvm",
-        "--convert-index-to-llvm",
-        "--finalize-memref-to-llvm",
-        "--reconcile-unrealized-casts",
-        "--verify-each=false",
-        "--remove-io-cast",
-        "--reconcile-unrealized-casts",
+        "--io-loop-batching",
+        "--io-async-promotion",
+        "--io-mmap-promotion",
+        "--io-prefetch-injection",
+        # ----------------------------------------
+        
+        # --- KEEP ALL LLVM LOWERING DISABLED ---
+        # "--cir-to-llvm-inhouse",
+        # "--convert-io-to-llvm",
+        # "--convert-scf-to-cf",
+        # "--convert-cf-to-llvm",
+        # "--convert-arith-to-llvm",
+        # "--convert-index-to-llvm",
+        # "--finalize-memref-to-llvm",
+        # "--remove-io-cast",
+        # "--reconcile-unrealized-casts",
+        # ---------------------------------------
+        
         "-o", llvm_dialect_clean_file
     ] + io_opt_target_flag
-
     # 3. Execute MLIR Passes (WITH FALLBACK)
     mlir_success = run_cmd(io_opt_cmd, f"End-to-End MLIR Compilation", allow_failure=True)
     
@@ -249,6 +256,7 @@ def main():
                 unknown_flags.append(arg)
         i += 1
 
+    
     # --- 2. Auto-Detect Host Triple ---
     if not target_triple:
         try:
@@ -265,7 +273,6 @@ def main():
     # Create blacklist of files known to break with the ClangCI cir tool
     # At the moment it is a very blunt tool
     cir_blacklist = [
-        "crc32",     # Fails on SSE4.2 hardware intrinsics
         "analyze.c", 
         "copyfrom.c",
         "explain.c",
@@ -281,9 +288,15 @@ def main():
         "planner.c",
         "appendinfo.c",
         "plancat.c",
-        "rewriteHandle"
+        "rewriteHandle.c",
+        "zic.c",
+        "pg_popcount_avx512.c", 
+        "pg_popcount_sse42.c",
+        "pg_crc32c_sse42.c",
+        "pg_crc32c_choose.c",
+        "bootparse.c"
     ]
-
+   
     if args_c:
         # Compile only mode
         for src in sources:

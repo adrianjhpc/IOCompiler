@@ -9,6 +9,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Dialect/DLTI/DLTI.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
@@ -103,7 +104,8 @@ struct CIRToLLVMInHousePass : public mlir::PassWrapper<CIRToLLVMInHousePass, mli
 
   void runOnOperation() override {
     mlir::PassManager pm(&getContext());
-    
+    mlir::ModuleOp module = getOperation();
+ 
     // Disable the internal verifier because we are handing it our temporary bridging IR
     pm.enableVerifier(false); 
     
@@ -112,7 +114,11 @@ struct CIRToLLVMInHousePass : public mlir::PassWrapper<CIRToLLVMInHousePass, mli
     
     if (mlir::failed(pm.run(getOperation())))
       signalPassFailure();
+
+    module->removeAttr("dlti.dl_spec");
+
   }
+
 
 };
 
@@ -127,7 +133,8 @@ int main(int argc, char **argv) {
                   mlir::arith::ArithDialect,
                   mlir::LLVM::LLVMDialect,
                   mlir::io::IODialect,
-                  cir::CIRDialect>();
+                  cir::CIRDialect,
+                  mlir::DLTIDialect>();
 
   // Register our custom passes
   mlir::io::registerRecogniseIOPass();

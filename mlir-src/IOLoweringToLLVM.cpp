@@ -26,7 +26,7 @@ static LLVM::LLVMFuncOp getOrInsertFunc(ConversionPatternRewriter &rewriter,
     // If it doesn't exist, insert it at the top of the module
     OpBuilder::InsertionGuard insertGuard(rewriter);
     rewriter.setInsertionPointToStart(module.getBody());
-    return rewriter.create<LLVM::LLVMFuncOp>(module.getLoc(), name, type);
+    return LLVM::LLVMFuncOp::create(rewriter, module.getLoc(), name, type);
 }
 
 // ============================================================================
@@ -47,7 +47,7 @@ struct BatchWriteLowering : public ConvertOpToLLVMPattern<io::BatchWriteOp> {
     );
     auto writeFunc = getOrInsertFunc(rewriter, module, "write", writeType);
 
-    Value fdI32 = rewriter.create<LLVM::TruncOp>(op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
+    Value fdI32 = LLVM::TruncOp::create(rewriter, op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
 
     Value rawPtr;
     if (auto memrefType = mlir::dyn_cast<MemRefType>(op.getBuffer().getType())) {
@@ -56,8 +56,8 @@ struct BatchWriteLowering : public ConvertOpToLLVMPattern<io::BatchWriteOp> {
         rawPtr = adaptor.getBuffer();
     }
 
-    auto llvmCall = rewriter.create<LLVM::CallOp>(
-        op.getLoc(), writeFunc, ValueRange{fdI32, rawPtr, adaptor.getTotalSize()}
+    auto llvmCall = LLVM::CallOp::create(
+        rewriter, op.getLoc(), writeFunc, ValueRange{fdI32, rawPtr, adaptor.getTotalSize()}
     );
 
     rewriter.replaceOp(op, llvmCall.getResult());
@@ -83,39 +83,39 @@ struct BatchWriteVLowering : public ConvertOpToLLVMPattern<io::BatchWriteVOp> {
     auto writevFunc = getOrInsertFunc(rewriter, module, "writev", writevType);
 
     Value fdI32 = adaptor.getFd();
-    Value vectorCountI32 = rewriter.create<LLVM::TruncOp>(loc, i32Ty, adaptor.getCount());
+    Value vectorCountI32 = LLVM::TruncOp::create(rewriter, loc, i32Ty, adaptor.getCount());
 
-    Value iovecArrayPtr = rewriter.create<LLVM::AllocaOp>(
-        loc, voidPtrTy, iovecTy, vectorCountI32, /*alignment=*/8);
+    Value iovecArrayPtr = LLVM::AllocaOp::create(
+        rewriter, loc, voidPtrTy, iovecTy, vectorCountI32, /*alignment=*/8);
 
-    Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
     Value countIndex = op.getCount(); 
 
-    auto loop = rewriter.create<scf::ForOp>(loc, zero, countIndex, one);
+    auto loop = scf::ForOp::create(rewriter, loc, zero, countIndex, one);
     
     rewriter.setInsertionPointToStart(loop.getBody());
     Value iv = loop.getInductionVar();
-    Value ivI64 = rewriter.create<arith::IndexCastOp>(loc, sizeTy, iv);
+    Value ivI64 = arith::IndexCastOp::create(rewriter, loc, sizeTy, iv);
 
-    Value ptrValI64 = rewriter.create<memref::LoadOp>(loc, op.getPtrs(), ValueRange{iv});
-    Value ptrVal = rewriter.create<LLVM::IntToPtrOp>(loc, voidPtrTy, ptrValI64);
-    Value sizeVal = rewriter.create<memref::LoadOp>(loc, op.getSizes(), ValueRange{iv});
+    Value ptrValI64 = memref::LoadOp::create(rewriter, loc, op.getPtrs(), ValueRange{iv});
+    Value ptrVal = LLVM::IntToPtrOp::create(rewriter, loc, voidPtrTy, ptrValI64);
+    Value sizeVal = memref::LoadOp::create(rewriter, loc, op.getSizes(), ValueRange{iv});
 
-    Value iovAddr = rewriter.create<LLVM::GEPOp>(loc, voidPtrTy, iovecTy, iovecArrayPtr, ivI64);
+    Value iovAddr = LLVM::GEPOp::create(rewriter, loc, voidPtrTy, iovecTy, iovecArrayPtr, ivI64);
 
-    Value iovBaseAddr = rewriter.create<LLVM::GEPOp>(
-        loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 0});
-    rewriter.create<LLVM::StoreOp>(loc, ptrVal, iovBaseAddr);
+    Value iovBaseAddr = LLVM::GEPOp::create(
+        rewriter, loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 0});
+    LLVM::StoreOp::create(rewriter, loc, ptrVal, iovBaseAddr);
 
-    Value iovLenAddr = rewriter.create<LLVM::GEPOp>(
-        loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 1});
-    rewriter.create<LLVM::StoreOp>(loc, sizeVal, iovLenAddr);
+    Value iovLenAddr = LLVM::GEPOp::create(
+        rewriter, loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 1});
+    LLVM::StoreOp::create(rewriter, loc, sizeVal, iovLenAddr);
 
     rewriter.setInsertionPointAfter(loop);
 
-    auto llvmCall = rewriter.create<LLVM::CallOp>(
-        loc, writevFunc, ValueRange{fdI32, iovecArrayPtr, vectorCountI32});
+    auto llvmCall = LLVM::CallOp::create(
+        rewriter, loc, writevFunc, ValueRange{fdI32, iovecArrayPtr, vectorCountI32});
 
     rewriter.replaceOp(op, llvmCall.getResult());
     return success();
@@ -135,7 +135,7 @@ struct BatchReadLowering : public ConvertOpToLLVMPattern<io::BatchReadOp> {
     );
     auto readFunc = getOrInsertFunc(rewriter, module, "read", readType);
 
-    Value fdI32 = rewriter.create<LLVM::TruncOp>(op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
+    Value fdI32 = LLVM::TruncOp::create(rewriter, op.getLoc(), rewriter.getI32Type(), adaptor.getFd());
     
     Value rawPtr;
     if (auto memrefType = mlir::dyn_cast<MemRefType>(op.getBuffer().getType())) {
@@ -144,8 +144,8 @@ struct BatchReadLowering : public ConvertOpToLLVMPattern<io::BatchReadOp> {
         rawPtr = adaptor.getBuffer();
     }
 
-    auto llvmCall = rewriter.create<LLVM::CallOp>(
-        op.getLoc(), readFunc, ValueRange{fdI32, rawPtr, adaptor.getTotalSize()}
+    auto llvmCall = LLVM::CallOp::create(
+        rewriter, op.getLoc(), readFunc, ValueRange{fdI32, rawPtr, adaptor.getTotalSize()}
     );
 
     rewriter.replaceOp(op, llvmCall.getResult());
@@ -171,39 +171,39 @@ struct BatchReadVLowering : public ConvertOpToLLVMPattern<io::BatchReadVOp> {
     auto readvFunc = getOrInsertFunc(rewriter, module, "readv", readvType);
 
     Value fdI32 = adaptor.getFd();
-    Value vectorCountI32 = rewriter.create<LLVM::TruncOp>(loc, i32Ty, adaptor.getCount());
+    Value vectorCountI32 = LLVM::TruncOp::create(rewriter, loc, i32Ty, adaptor.getCount());
 
-    Value iovecArrayPtr = rewriter.create<LLVM::AllocaOp>(
-        loc, voidPtrTy, iovecTy, vectorCountI32, /*alignment=*/8);
+    Value iovecArrayPtr = LLVM::AllocaOp::create(
+        rewriter, loc, voidPtrTy, iovecTy, vectorCountI32, /*alignment=*/8);
 
-    Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
     Value countIndex = op.getCount(); 
 
-    auto loop = rewriter.create<scf::ForOp>(loc, zero, countIndex, one);
+    auto loop = scf::ForOp::create(rewriter, loc, zero, countIndex, one);
     
     rewriter.setInsertionPointToStart(loop.getBody());
     Value iv = loop.getInductionVar();
-    Value ivI64 = rewriter.create<arith::IndexCastOp>(loc, sizeTy, iv);
+    Value ivI64 = arith::IndexCastOp::create(rewriter, loc, sizeTy, iv);
 
-    Value ptrValI64 = rewriter.create<memref::LoadOp>(loc, op.getPtrs(), ValueRange{iv});
-    Value ptrVal = rewriter.create<LLVM::IntToPtrOp>(loc, voidPtrTy, ptrValI64);
-    Value sizeVal = rewriter.create<memref::LoadOp>(loc, op.getSizes(), ValueRange{iv});
+    Value ptrValI64 = memref::LoadOp::create(rewriter, loc, op.getPtrs(), ValueRange{iv});
+    Value ptrVal = LLVM::IntToPtrOp::create(rewriter, loc, voidPtrTy, ptrValI64);
+    Value sizeVal = memref::LoadOp::create(rewriter, loc, op.getSizes(), ValueRange{iv});
 
-    Value iovAddr = rewriter.create<LLVM::GEPOp>(loc, voidPtrTy, iovecTy, iovecArrayPtr, ivI64);
+    Value iovAddr = LLVM::GEPOp::create(rewriter, loc, voidPtrTy, iovecTy, iovecArrayPtr, ivI64);
 
-    Value iovBaseAddr = rewriter.create<LLVM::GEPOp>(
-        loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 0});
-    rewriter.create<LLVM::StoreOp>(loc, ptrVal, iovBaseAddr);
+    Value iovBaseAddr = LLVM::GEPOp::create(
+        rewriter, loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 0});
+    LLVM::StoreOp::create(rewriter, loc, ptrVal, iovBaseAddr);
 
-    Value iovLenAddr = rewriter.create<LLVM::GEPOp>(
-        loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 1});
-    rewriter.create<LLVM::StoreOp>(loc, sizeVal, iovLenAddr);
+    Value iovLenAddr = LLVM::GEPOp::create(
+        rewriter, loc, voidPtrTy, iovecTy, iovAddr, ArrayRef<LLVM::GEPArg>{0, 1});
+    LLVM::StoreOp::create(rewriter, loc, sizeVal, iovLenAddr);
 
     rewriter.setInsertionPointAfter(loop);
 
-    auto llvmCall = rewriter.create<LLVM::CallOp>(
-        loc, readvFunc, ValueRange{fdI32, iovecArrayPtr, vectorCountI32});
+    auto llvmCall = LLVM::CallOp::create(
+        rewriter, loc, readvFunc, ValueRange{fdI32, iovecArrayPtr, vectorCountI32});
 
     rewriter.replaceOp(op, llvmCall.getResult());
     return success();
@@ -257,9 +257,9 @@ struct MmapLowering : public ConvertOpToLLVMPattern<io::MmapOp> {
         getOrInsertFunc(rewriter, module, "mmap", funcTy);
 
         // POSIX mappings: PROT_READ = 1, MAP_PRIVATE = 2
-        Value nullPtr = rewriter.create<LLVM::ZeroOp>(loc, ptrTy);
-        Value protRead = rewriter.create<LLVM::ConstantOp>(loc, i32Ty, rewriter.getI32IntegerAttr(1));
-        Value mapPrivate = rewriter.create<LLVM::ConstantOp>(loc, i32Ty, rewriter.getI32IntegerAttr(2));
+        Value nullPtr = LLVM::ZeroOp::create(rewriter, loc, ptrTy);
+        Value protRead = LLVM::ConstantOp::create(rewriter, loc, i32Ty, rewriter.getI32IntegerAttr(1));
+        Value mapPrivate = LLVM::ConstantOp::create(rewriter, loc, i32Ty, rewriter.getI32IntegerAttr(2));
         
         SmallVector<Value> args = {
             nullPtr, adaptor.getSize(), protRead, mapPrivate, adaptor.getFd(), adaptor.getOffset()
@@ -289,17 +289,16 @@ struct PrefetchLowering : public ConvertOpToLLVMPattern<io::PrefetchOp> {
         getOrInsertFunc(rewriter, module, "posix_fadvise", funcTy);
 
         // POSIX mapping: POSIX_FADV_WILLNEED = 3
-        Value zeroOffset = rewriter.create<LLVM::ConstantOp>(loc, i64Ty, rewriter.getI64IntegerAttr(0));
-        Value advice = rewriter.create<LLVM::ConstantOp>(loc, i32Ty, rewriter.getI32IntegerAttr(3));
+        Value zeroOffset = LLVM::ConstantOp::create(rewriter, loc, i64Ty, rewriter.getI64IntegerAttr(0));
+        Value advice = LLVM::ConstantOp::create(rewriter, loc, i32Ty, rewriter.getI32IntegerAttr(3));
         
         SmallVector<Value> args = {
             adaptor.getFd(), zeroOffset, adaptor.getLookaheadSize(), advice
         };
         
-        // CRITICAL FIX: io.prefetch returns nothing, so we can't "replace" it with an i32.
         // We create the call independently, then erase the prefetch op.
-        rewriter.create<LLVM::CallOp>(
-            loc, TypeRange{i32Ty}, SymbolRefAttr::get(ctx, "posix_fadvise"), args);
+        LLVM::CallOp::create(
+            rewriter, loc, TypeRange{i32Ty}, SymbolRefAttr::get(ctx, "posix_fadvise"), args);
         
         rewriter.eraseOp(op);
             
@@ -329,8 +328,8 @@ struct SubmitLowering : public ConvertOpToLLVMPattern<io::SubmitOp> {
             rawPtr = adaptor.getBuffer();
         }
 
-        auto llvmCall = rewriter.create<LLVM::CallOp>(
-            loc, TypeRange{rewriter.getI64Type()}, SymbolRefAttr::get(rewriter.getContext(), "read"), 
+        auto llvmCall = LLVM::CallOp::create(
+            rewriter, loc, TypeRange{rewriter.getI64Type()}, SymbolRefAttr::get(rewriter.getContext(), "read"), 
             ValueRange{adaptor.getFd(), rawPtr, adaptor.getSize()}
         );
 
