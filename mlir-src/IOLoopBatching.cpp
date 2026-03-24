@@ -156,10 +156,8 @@ static bool isContiguousMemoryAccess(Value buffer, scf::ForOp loop, Value writeS
 
 
 // Target cir::ForOp directly to bypass any broken interfaces!
-struct CirLoopBatchingPattern : public OpRewritePattern<cir::ForOp> {
-  using OpRewritePattern<cir::ForOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(cir::ForOp forOp, PatternRewriter &rewriter) const override {
+struct CirLoopBatchingPattern {
+  static LogicalResult matchAndRewrite(cir::ForOp forOp, IRRewriter &rewriter) {    
     llvm::errs() << "[IOOpt] Found a cir::ForOp! Analyzing...\n";
 
     Region &bodyRegion = forOp.getBody();
@@ -322,10 +320,8 @@ struct CirLoopBatchingPattern : public OpRewritePattern<cir::ForOp> {
   }
 };
 
-struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
-  using OpRewritePattern<scf::ForOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(scf::ForOp loop, PatternRewriter &rewriter) const override {
+struct HoistWriteLoopPattern {
+  static LogicalResult matchAndRewrite(scf::ForOp loop, IRRewriter &rewriter) {
     Block *body = loop.getBody();
     if (!body || body->empty()) return failure();
 
@@ -403,10 +399,8 @@ struct HoistWriteLoopPattern : public OpRewritePattern<scf::ForOp> {
   }
 };
 
-struct HoistReadLoopPattern : public OpRewritePattern<scf::ForOp> {
-  using OpRewritePattern<scf::ForOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(scf::ForOp loop, PatternRewriter &rewriter) const override {
+struct HoistReadLoopPattern {
+  static LogicalResult matchAndRewrite(scf::ForOp loop, IRRewriter &rewriter) {
     Block *body = loop.getBody();
     if (!body || body->empty()) return failure();
 
@@ -559,20 +553,35 @@ struct IOLoopBatchingPass : public PassWrapper<IOLoopBatchingPass, OperationPass
     llvm::errs() << "\n[IOOpt] ---> Pass activated on Module! <__-\n";
 
     ModuleOp module = getOperation();
-
     mlir::io::bootstrapTargetInfo(module);
-
     MLIRContext *context = &getContext();
+    IRRewriter rewriter(context);
 
-    RewritePatternSet patterns(context);
-    patterns.add<HoistWriteLoopPattern>(context);
-    patterns.add<HoistReadLoopPattern>(context);
-    patterns.add<CirLoopBatchingPattern>(context);
+    // Safely collect all loops first to avoid iterator invalidation
+    SmallVector<cir::ForOp> cirLoops;
+    SmallVector<scf::ForOp> scfLoops;
 
-    // Apply the patterns to the entire module
-    if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
-      signalPassFailure();
+    module.walk([&](Operation *op) {
+      if (auto cirLoop = dyn_cast<cir::ForOp>(op)) {
+        cirLoops.push_back(cirLoop);
+      } else if (auto scfLoop = dyn_cast<scf::ForOp>(op)) {
+        scfLoops.push_back(scfLoop);
+      }
+    });
+
+    // Deterministically apply the CIR pattern
+   for (cir::ForOp loop : cirLoops) {
+      // Call the static function directly
+      (void)CirLoopBatchingPattern::matchAndRewrite(loop, rewriter);
     }
+
+    // Deterministically apply the SCF patterns
+    for (scf::ForOp loop : scfLoops) {
+      if (succeeded(HoistWriteLoopPattern::matchAndRewrite(loop, rewriter))) {
+        continue; 
+      }
+      (void)HoistReadLoopPattern::matchAndRewrite(loop, rewriter);
+    }   
   }
 };
 

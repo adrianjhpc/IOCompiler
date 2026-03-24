@@ -1,6 +1,5 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/CallInterfaces.h"
@@ -27,152 +26,6 @@ static StringRef getCalleeName(CallOpInterface call) {
     return "";
 }
 
-struct PromoteToZeroCopyPattern : public RewritePattern {
-    PromoteToZeroCopyPattern(MLIRContext *context)
-        : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/2, context) {}
-
-    LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter) const override {
-        auto readCall = dyn_cast<CallOpInterface>(op);
-        if (!readCall) return failure();
-
-        auto calleeAttr = dyn_cast_or_null<SymbolRefAttr>(readCall.getCallableForCallee());
-        if (!calleeAttr) return failure();
-       
-        StringRef callee = getCalleeName(readCall); 
-        if (callee != "read" && callee != "read64" && callee != "read32") return failure();
-        if (readCall->getNumOperands() != 3) return failure();
-        
-        llvm::errs() << "[IOOpt-Telemetry] Found 'read' call. Scanning block...\n";
-        
-        Value fdIn = readCall->getOperand(0);
-        Value readSize = readCall->getOperand(2);
-
-        // Hardened to trace through array indexing and pointer math
-        auto getRootAllocation = [](Value v) {
-            while (Operation *def = v.getDefiningOp()) {
-                StringRef name = def->getName().getStringRef();
-                if (name == "cir.cast" || name == "cir.load" || 
-                    name == "cir.ptr_stride" || name == "cir.get_element") {
-                    v = def->getOperand(0);
-                } else {
-                    break;
-                }
-            }
-            return v;
-        };        
-
-        Value readBufferRoot = getRootAllocation(readCall->getOperand(1));
-
-        CallOpInterface writeCall = nullptr; 
-        
-        for (Operation *nextOp = op->getNextNode(); nextOp != nullptr; nextOp = nextOp->getNextNode()) {
-            
-            if (auto maybeWrite = dyn_cast<CallOpInterface>(nextOp)) {
-                auto nextCalleeAttr = dyn_cast_or_null<SymbolRefAttr>(maybeWrite.getCallableForCallee());
-                if (nextCalleeAttr) {
-                    StringRef nextCallee = nextCalleeAttr.getRootReference().getValue();
-                    if (nextCallee == "write" || nextCallee == "write64" || nextCallee == "write32") {
-                        if (maybeWrite->getNumOperands() == 3) {
-                            Value writeBufferRoot = getRootAllocation(maybeWrite->getOperand(1));
-                            if (readBufferRoot == writeBufferRoot) {
-                                writeCall = maybeWrite;
-                                break; 
-                            } else {
-                                llvm::errs() << "[IOOpt-Telemetry] Abort: Found 'write', but buffer roots mismatch!\n";
-                            }
-                        }
-                    }
-                }
-            }
-
-            StringRef opName = nextOp->getName().getStringRef();
-            
-            if (opName == "cir.store") {
-                Value storePtr = nextOp->getOperand(1);
-                if (getRootAllocation(storePtr) == readBufferRoot) {
-                    llvm::errs() << "[IOOpt-Telemetry] Abort: cir.store mutated the buffer root!\n";
-                    return failure(); 
-                }
-                continue; 
-            }
-            
-            if (isa<CallOpInterface>(nextOp)) {
-                llvm::errs() << "[IOOpt-Telemetry] Abort: Intervening CallOp found: " << opName << "\n";
-                return failure(); 
-            }
-            
-            if (auto memInterface = dyn_cast<MemoryEffectOpInterface>(nextOp)) {
-                if (memInterface.hasEffect<MemoryEffects::Write>()) {
-                    llvm::errs() << "[IOOpt-Telemetry] Abort: Intervening memory write found: " << opName << "\n";
-                    return failure();
-                }
-            }
-        }
-
-        if (!writeCall) {
-            llvm::errs() << "[IOOpt-Telemetry] Abort: Reached end of block. No matching 'write' found.\n";
-            return failure();
-        }
-
-        Value fdOut = writeCall->getOperand(0);
-        Value writeSizeOut = writeCall->getOperand(2);
-
-        if (getRootAllocation(readSize) != getRootAllocation(writeSizeOut)) {
-            llvm::errs() << "[IOOpt-Telemetry] Abort: Size variables do not match.\n";
-            return failure();
-        }
-
-        // ==========================================
-        // The Rewrite
-        // ==========================================
-        rewriter.setInsertionPoint(writeCall);
-        Value nullOffset = readCall->getOperand(1); 
-        Location loc = writeCall->getLoc();
-
-        auto i32Ty = rewriter.getI32Type();
-        auto i64Ty = rewriter.getI64Type();
-
-        // Safely cast ClangIR input types to standard MLIR types
-        Value stdFdOut = fdOut;
-        if (stdFdOut.getType() != i32Ty) 
-            stdFdOut = mlir::io::IOCastOp::create(rewriter, loc, i32Ty, stdFdOut);
-            
-        Value stdFdIn = fdIn;
-        if (stdFdIn.getType() != i32Ty) 
-            stdFdIn = mlir::io::IOCastOp::create(rewriter, loc, i32Ty, stdFdIn);
-            
-        Value stdSizeOut = writeSizeOut;
-        if (stdSizeOut.getType() != i64Ty) 
-            stdSizeOut = mlir::io::IOCastOp::create(rewriter, loc, i64Ty, stdSizeOut);
-
-        // Create the Sendfile op with mathematically pure standard types
-        auto sendfileOp = mlir::io::SendfileOp::create(
-            rewriter,
-            loc,
-            i64Ty, 
-            stdFdOut,                           
-            stdFdIn,                            
-            nullOffset,                      
-            stdSizeOut                         
-        );
-
-        Value replacement = sendfileOp.getBytesWritten();
-        Type expectedReturnType = readCall->getResult(0).getType();
-
-        // Bridge the return value back to ClangIR
-        if (replacement.getType() != expectedReturnType) {
-            replacement = mlir::io::IOCastOp::create(rewriter, loc, expectedReturnType, replacement);
-        }
-
-        // Complete the replacements
-        rewriter.replaceOp(writeCall, replacement);
-        rewriter.replaceOp(readCall, replacement);
-
-        llvm::errs() << "[IOOpt-Telemetry] SUCCESS: Replaced read/write with sendfile!\n";
-        return success();
-    }
-};
-
 struct ZeroCopyPromotionPass : public PassWrapper<ZeroCopyPromotionPass, OperationPass<ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ZeroCopyPromotionPass)
     StringRef getArgument() const final { return "io-zero-copy-promotion"; }
@@ -184,13 +37,138 @@ struct ZeroCopyPromotionPass : public PassWrapper<ZeroCopyPromotionPass, Operati
 
     void runOnOperation() override {
         ModuleOp module = getOperation();
-        MLIRContext *context = &getContext();
+        IRRewriter rewriter(&getContext());
 
-        RewritePatternSet patterns(context);
-        patterns.add<PromoteToZeroCopyPattern>(context);
-        
-        if (failed(applyPatternsGreedily(module, std::move(patterns))))
-            signalPassFailure();
+        // Find all read calls first (to avoid modifying the tree while walking it)
+        SmallVector<CallOpInterface> readCalls;
+        module.walk([&](CallOpInterface readCall) {
+            auto calleeAttr = dyn_cast_or_null<SymbolRefAttr>(readCall.getCallableForCallee());
+            if (!calleeAttr) return;
+            
+            StringRef callee = getCalleeName(readCall); 
+            if ((callee == "read" || callee == "read64" || callee == "read32") && 
+                 readCall->getNumOperands() == 3) {
+                readCalls.push_back(readCall);
+            }
+        });
+
+        // Process them sequentially
+        for (CallOpInterface readCall : readCalls) {
+            llvm::errs() << "[IOOpt-Telemetry] Found 'read' call. Scanning block...\n";
+            
+            Value fdIn = readCall->getOperand(0);
+            Value readSize = readCall->getOperand(2);
+
+            auto getRootAllocation = [](Value v) {
+                while (Operation *def = v.getDefiningOp()) {
+                    StringRef name = def->getName().getStringRef();
+                    if (name == "cir.cast" || name == "cir.load" || 
+                        name == "cir.ptr_stride" || name == "cir.get_element") {
+                        v = def->getOperand(0);
+                    } else break;
+                }
+                return v;
+            };        
+
+            Value readBufferRoot = getRootAllocation(readCall->getOperand(1));
+            CallOpInterface writeCall = nullptr; 
+            bool abortSearch = false;
+            
+            // Scan forward in the block for the matching write
+            for (Operation *nextOp = readCall->getNextNode(); nextOp != nullptr; nextOp = nextOp->getNextNode()) {
+                if (auto maybeWrite = dyn_cast<CallOpInterface>(nextOp)) {
+                    auto nextCalleeAttr = dyn_cast_or_null<SymbolRefAttr>(maybeWrite.getCallableForCallee());
+                    if (nextCalleeAttr) {
+                        StringRef nextCallee = nextCalleeAttr.getRootReference().getValue();
+                        if (nextCallee == "write" || nextCallee == "write64" || nextCallee == "write32") {
+                            if (maybeWrite->getNumOperands() == 3) {
+                                Value writeBufferRoot = getRootAllocation(maybeWrite->getOperand(1));
+                                if (readBufferRoot == writeBufferRoot) {
+                                    writeCall = maybeWrite;
+                                    break; 
+                                } else {
+                                    llvm::errs() << "[IOOpt-Telemetry] Abort: Found 'write', but buffer roots mismatch!\n";
+                                }
+                            }
+                        }
+                    }
+                }
+
+                StringRef opName = nextOp->getName().getStringRef();
+                if (opName == "cir.store") {
+                    Value storePtr = nextOp->getOperand(1);
+                    if (getRootAllocation(storePtr) == readBufferRoot) {
+                        llvm::errs() << "[IOOpt-Telemetry] Abort: cir.store mutated the buffer root!\n";
+                        abortSearch = true; break; 
+                    }
+                    continue; 
+                }
+                
+                if (isa<CallOpInterface>(nextOp)) {
+                    llvm::errs() << "[IOOpt-Telemetry] Abort: Intervening CallOp found: " << opName << "\n";
+                    abortSearch = true; break; 
+                }
+                
+                if (auto memInterface = dyn_cast<MemoryEffectOpInterface>(nextOp)) {
+                    if (memInterface.hasEffect<MemoryEffects::Write>()) {
+                        llvm::errs() << "[IOOpt-Telemetry] Abort: Intervening memory write found: " << opName << "\n";
+                        abortSearch = true; break;
+                    }
+                }
+            }
+
+            if (abortSearch || !writeCall) {
+                if (!writeCall && !abortSearch)
+                    llvm::errs() << "[IOOpt-Telemetry] Abort: Reached end of block. No matching 'write' found.\n";
+                continue;
+            }
+
+            Value fdOut = writeCall->getOperand(0);
+            Value writeSizeOut = writeCall->getOperand(2);
+
+            if (getRootAllocation(readSize) != getRootAllocation(writeSizeOut)) {
+                llvm::errs() << "[IOOpt-Telemetry] Abort: Size variables do not match.\n";
+                continue;
+            }
+
+            // ==========================================
+            // The Rewrite
+            // ==========================================
+            rewriter.setInsertionPoint(writeCall);
+            Value nullOffset = readCall->getOperand(1); 
+            Location loc = writeCall->getLoc();
+
+            auto i32Ty = rewriter.getI32Type();
+            auto i64Ty = rewriter.getI64Type();
+
+            Value stdFdOut = fdOut;
+            if (stdFdOut.getType() != i32Ty) 
+                stdFdOut = mlir::io::IOCastOp::create(rewriter, loc, i32Ty, stdFdOut);
+                
+            Value stdFdIn = fdIn;
+            if (stdFdIn.getType() != i32Ty) 
+                stdFdIn = mlir::io::IOCastOp::create(rewriter, loc, i32Ty, stdFdIn);
+                
+            Value stdSizeOut = writeSizeOut;
+            if (stdSizeOut.getType() != i64Ty) 
+                stdSizeOut = mlir::io::IOCastOp::create(rewriter, loc, i64Ty, stdSizeOut);
+
+            auto sendfileOp = mlir::io::SendfileOp::create(
+                rewriter, loc, i64Ty, stdFdOut, stdFdIn, nullOffset, stdSizeOut
+            );
+
+            Value replacement = sendfileOp.getBytesWritten();
+            Type expectedReturnType = readCall->getResult(0).getType();
+
+            if (replacement.getType() != expectedReturnType) {
+                replacement = mlir::io::IOCastOp::create(rewriter, loc, expectedReturnType, replacement);
+            }
+
+            rewriter.replaceOp(writeCall, replacement);
+            rewriter.replaceOp(readCall, replacement);
+
+            llvm::errs() << "[IOOpt-Telemetry] SUCCESS: Replaced read/write with sendfile!\n";
+        }
     }
 };
 
