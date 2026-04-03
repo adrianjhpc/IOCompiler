@@ -133,7 +133,7 @@ IOOpt behavior can be tuned by passing LLVM standard arguments during the linkin
 
 ---
 
-## Autbors
+## Authors
 Adrian Jackson 
 
 ---
