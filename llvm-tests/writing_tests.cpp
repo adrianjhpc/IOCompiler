@@ -25,7 +25,7 @@ NOINLINE void test_non_contiguous_write(int fd) {
     // 150 is less than the default 4096-byte Shadow Buffer limit.
     // The pass will correctly allocate a 150-byte stack buffer and use a single write().
 
-    // CHECK: %shadow.buf = alloca [150 x i8], align 4096
+    // CHECK: %shadow.buf = alloca [150 x i8], align 64
     // CHECK: call {{.*}} @write(i32 {{.*}}, ptr %shadow.buf, i64 150)
     write(fd, buf1, 50);
     write(fd, buf2, 50);
