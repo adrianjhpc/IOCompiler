@@ -66,7 +66,7 @@ def compile_to_bitcode(source_file, output_bc, target_triple, flags, disable_mli
         for f in [cir_mlir_file, llvm_dialect_clean_file, ll_file]:
             if os.path.exists(f): os.remove(f)
 
-    # 1. Frontend: C/C++ to ClangIR (NOW WITH FALLBACK)
+    # Frontend: C/C++ to ClangIR 
     frontend_success = run_cmd(
         [compiler, "-fclangir", "-emit-cir", source_file, "-o", cir_mlir_file] + clang_target_flag + flags,
         f"Frontend ({compiler} to CIR) for {source_file}",
@@ -140,8 +140,16 @@ def compile_to_bitcode(source_file, output_bc, target_triple, flags, disable_mli
         return
 
     # 4. Translate: Pure LLVM Dialect to LLVM IR Text
-    run_cmd([CIR_TRANSLATE, llvm_dialect_clean_file, "--cir-to-llvmir", f"--target={target_triple}", "-o", ll_file],
-            f"Translation to LLVM IR")
+    cir_success = run_cmd([CIR_TRANSLATE, llvm_dialect_clean_file, "--cir-to-llvmir", f"--target={target_triple}", "-o", ll_file],
+            f"Translation to LLVM IR", allow_failure=True)
+
+    if not cir_success:
+        print(f"[*] CIR conversion failed. Auto-falling back to standard Clang for {source_file}...")
+        run_cmd([compiler, "-emit-llvm", "-c", source_file, "-o", output_bc] + clang_target_flag + flags,
+                f"Fallback Fast Path ({compiler} directly to LLVM Bitcode)")
+        cleanup_intermediates()
+        return
+
             
     # 5. Assemble: LLVM IR Text to LLVM Bitcode
     run_cmd([LLVM_AS, ll_file, "-o", output_bc],
@@ -269,50 +277,80 @@ def main():
     # --- 3. Route to the correct pipeline ---
     requires_cxx_linker = any(src.endswith(('.cpp', '.cxx', '.cc')) for src in sources)
 
-    # TEMPORARY HACK
-    # Create blacklist of files known to break with the ClangCI cir tool
-    # At the moment it is a very blunt tool
-    cir_blacklist = [
-        "analyze.c", 
-        "copyfrom.c",
-        "explain.c",
-        "foreigncmds.c",
-        "tablecmds.c",
-        "execMain.c",
-        "execPartition.c",
-        "nodeForeignscan.c",
-        "nodeLockRows.c",
-        "nodeModifyTable.c",
-        "foreign.c",
-        "outfuncs.c",
-        "planner.c",
-        "appendinfo.c",
-        "plancat.c",
-        "rewriteHandle.c",
-        "zic.c",
-        "pg_popcount_avx512.c", 
-        "pg_popcount_sse42.c",
-        "pg_crc32c_sse42.c",
-        "pg_crc32c_choose.c",
-        "bootparse.c"
-    ]
+#    # TEMPORARY HACK
+#    # Create blacklist of files known to break with the ClangCI cir tool
+#    # At the moment it is a very blunt tool
+#    cir_blacklist = [
+#        "analyze.c", 
+#        "copyfrom.c",
+#        "explain.c",
+#        "foreigncmds.c",
+#        "tablecmds.c",
+#        "execMain.c",
+#        "execPartition.c",
+#        "nodeForeignscan.c",
+#        "nodeLockRows.c",
+#        "nodeModifyTable.c",
+#        "foreign.c",
+#        "outfuncs.c",
+#        "planner.c",
+#        "appendinfo.c",
+#        "plancat.c",
+#        "rewriteHandler.c",
+#        "rewriteHandle.c"
+#        "zic.c",
+#        "pg_popcount_avx512.c", 
+#        "pg_popcount_sse42.c",
+#        "pg_crc32c_sse42.c",
+#        "pg_crc32c_choose.c",
+#        "bootparse.c",
+#        "gram.c",
+#       "async.c",
+#        "explain_dr.c"
+#    ]
    
+#    if args_c:
+#        # Compile only mode
+#        for src in sources:
+#            # Check if the current source file is in our blacklist
+#            safe_disable_mlir = disable_mlir or any(bad_file in src for bad_file in cir_blacklist)
+            
+#            out_file = args_output if args_output else f"{os.path.splitext(src)[0]}.o"
+#            compile_to_bitcode(src, out_file, target_triple, unknown_flags, safe_disable_mlir)
+            
+#    else:
+#       # Compile and link mode
+#        bcs_to_link = objects.copy()
+#        for src in sources:
+#            # Check if the current source file is in our blacklist
+#            safe_disable_mlir = disable_mlir or any(bad_file in src for bad_file in cir_blacklist)
+#            
+#            bc_file = f"{os.path.splitext(src)[0]}.o"
+#            compile_to_bitcode(src, bc_file, target_triple, unknown_flags, safe_disable_mlir)
+#            bcs_to_link.append(bc_file)
+#
+#        out_bin = args_output if args_output else "a.out"
+#        link_with_lto(bcs_to_link, out_bin, target_triple, unknown_flags, disable_llvm, requires_cxx_linker)
+
+    # The Surgical Strike Whitelist: 
+    # Only run ClangIR and io-opt on the core storage files.
+
     if args_c:
         # Compile only mode
         for src in sources:
-            # Check if the current source file is in our blacklist
-            safe_disable_mlir = disable_mlir or any(bad_file in src for bad_file in cir_blacklist)
-            
+            # Disable MLIR if the user flagged it, OR if the file is NOT on the whitelist
+            safe_disable_mlir = disable_mlir 
+
             out_file = args_output if args_output else f"{os.path.splitext(src)[0]}.o"
             compile_to_bitcode(src, out_file, target_triple, unknown_flags, safe_disable_mlir)
-            
+
     else:
         # Compile and link mode
         bcs_to_link = objects.copy()
         for src in sources:
-            # Check if the current source file is in our blacklist
-            safe_disable_mlir = disable_mlir or any(bad_file in src for bad_file in cir_blacklist)
-            
+            # Disable MLIR if the user flagged it, OR if the file is NOT on the whitelist
+            safe_disable_mlir = disable_mlir 
+
             bc_file = f"{os.path.splitext(src)[0]}.o"
             compile_to_bitcode(src, bc_file, target_triple, unknown_flags, safe_disable_mlir)
             bcs_to_link.append(bc_file)

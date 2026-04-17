@@ -133,6 +133,15 @@ namespace {
         return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FREAD} : IOArgs{nullptr, nullptr, nullptr, IOArgs::NONE};
     }
 
+    if (Demangled == "fwrite" || Demangled == "efwrite") {
+        Value *Bytes = getCStreamBytes(Call);
+        return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FWRITE} : IOArgs{nullptr, nullptr, nullptr, IOArgs::NONE};
+    }
+    if (Demangled == "fread" || Demangled == "efread") {
+        Value *Bytes = getCStreamBytes(Call);
+        return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FREAD} : IOArgs{nullptr, nullptr, nullptr, IOArgs::NONE};
+    }
+
     if (Demangled == "preadv" || Demangled == "preadv2") return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PREADV};
     if (Demangled == "pwritev" || Demangled == "pwritev2") return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PWRITEV};
     if (Demangled == "splice") return {Call->getArgOperand(2), Call->getArgOperand(0), Call->getArgOperand(4), IOArgs::SPLICE}; 
@@ -926,7 +935,6 @@ namespace {
             bool isRead = (Args.Type == IOArgs::POSIX_READ || Args.Type == IOArgs::C_FREAD || Args.Type == IOArgs::CXX_READ);
 
             if (isWrite || isRead) {
-              
               bool hasSideEffects = false;
               for (BasicBlock *ScanBB : L->blocks()) {
                   for (Instruction &ScanInst : *ScanBB) {
