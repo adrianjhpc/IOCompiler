@@ -6,6 +6,7 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/CaptureTracking.h"
@@ -67,17 +68,20 @@ struct IOConfig {
   bool EnableLogging;
 
   IOConfig() {
-      BatchThreshold = getEnvOrDefault("IO_BATCH_THRESHOLD", 4);
-      ShadowBufferSize = getEnvOrDefault("IO_SHADOW_BUFFER_MAX", 4096);
-      HighWaterMark = getEnvOrDefault("IO_HIGH_WATER_MARK", 65536);
-      EnableLogging = getEnvOrDefault("IO_ENABLE_LOGGING", 1) != 0;
+    BatchThreshold = getEnvOrDefault("IO_BATCH_THRESHOLD", 4);
+    if(BatchThreshold <= 0) BatchThreshold = 4;
+    ShadowBufferSize = getEnvOrDefault("IO_SHADOW_BUFFER_MAX", 4096);
+    if(ShadowBufferSize <= 0) ShadowBufferSize = 4096;
+    HighWaterMark = getEnvOrDefault("IO_HIGH_WATER_MARK", 65536);
+    if(HighWaterMark <= 0) HighWaterMark = 65536;
+    EnableLogging = getEnvOrDefault("IO_ENABLE_LOGGING", 1) != 0;
   }
 };
 
 static IOConfig Config;
 
 static void logMessage(const Twine &Msg) {
-    if (Config.EnableLogging) errs() << Msg << "\n";
+  if (Config.EnableLogging) errs() << Msg << "\n";
 }
 
 namespace {
@@ -94,11 +98,11 @@ namespace {
   };
 
   Value *getBaseFD(Value *Target) {
-      if (!Target) return nullptr;
-      if (Target->getType()->isPointerTy()) {
-          return const_cast<Value*>(getUnderlyingObject(Target));
-      }
-      return Target; 
+    if (!Target) return nullptr;
+    if (Target->getType()->isPointerTy()) {
+      return const_cast<Value*>(getUnderlyingObject(Target));
+    }
+    return Target; 
   }
 
   IOArgs getIOArguments(CallInst *Call, Function *F = nullptr) {
@@ -125,22 +129,13 @@ namespace {
     if (Demangled == "write" || Demangled == "write64") return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_WRITE};
     if (Demangled == "read" || Demangled == "read64")   return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_READ};
     
-    if (Demangled == "fwrite") {
-        Value *Bytes = getCStreamBytes(Call);
-        return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FWRITE} : IOArgs{nullptr, nullptr, nullptr, IOArgs::NONE};
-    }
-    if (Demangled == "fread") {
-        Value *Bytes = getCStreamBytes(Call);
-        return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FREAD} : IOArgs{nullptr, nullptr, nullptr, IOArgs::NONE};
-    }
-
     if (Demangled == "fwrite" || Demangled == "efwrite") {
-        Value *Bytes = getCStreamBytes(Call);
-        return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FWRITE} : IOArgs{nullptr, nullptr, nullptr, IOArgs::NONE};
+      Value *Bytes = getCStreamBytes(Call);
+      return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FWRITE} : IOArgs{nullptr, nullptr, nullptr, IOArgs::NONE};
     }
     if (Demangled == "fread" || Demangled == "efread") {
-        Value *Bytes = getCStreamBytes(Call);
-        return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FREAD} : IOArgs{nullptr, nullptr, nullptr, IOArgs::NONE};
+      Value *Bytes = getCStreamBytes(Call);
+      return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FREAD} : IOArgs{nullptr, nullptr, nullptr, IOArgs::NONE};
     }
 
     if (Demangled == "preadv" || Demangled == "preadv2") return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PREADV};
@@ -167,92 +162,92 @@ namespace {
       bool LocalChanged;
       
       do {
-          LocalChanged = false;
-          std::unordered_map<Function*, int> IOWrappers; 
+	LocalChanged = false;
+	std::unordered_map<Function*, int> IOWrappers; 
           
-          for (Function &F : M) {
-              if (F.isDeclaration()) continue;
-              int IOMapArg = -1;
-              bool hasIO = false;
-              unsigned instCount = 0;
+	for (Function &F : M) {
+	  if (F.isDeclaration()) continue;
+	  int IOMapArg = -1;
+	  bool hasIO = false;
+	  unsigned instCount = 0;
               
-              for (BasicBlock &BB : F) {
-                  for (Instruction &I : BB) {
-                      instCount++;
-                      if (auto *Call = dyn_cast<CallInst>(&I)) {
-                          Function *Callee = Call->getCalledFunction();
-                          IOArgs Args = getIOArguments(Call, Callee);
-                          if (Args.Type != IOArgs::NONE) {
-                              hasIO = true;
-                              if (auto *Arg = dyn_cast<Argument>(Args.Target)) IOMapArg = Arg->getArgNo();
-                          }
-                      }
-                  }
-              }
-              if (hasIO && instCount < 80 && IOMapArg != -1) IOWrappers[&F] = IOMapArg;
-          }
+	  for (BasicBlock &BB : F) {
+	    for (Instruction &I : BB) {
+	      instCount++;
+	      if (auto *Call = dyn_cast<CallInst>(&I)) {
+		Function *Callee = Call->getCalledFunction();
+		IOArgs Args = getIOArguments(Call, Callee);
+		if (Args.Type != IOArgs::NONE) {
+		  hasIO = true;
+		  if (auto *Arg = dyn_cast<Argument>(Args.Target)) IOMapArg = Arg->getArgNo();
+		}
+	      }
+	    }
+	  }
+	  if (hasIO && instCount < 80 && IOMapArg != -1) IOWrappers[&F] = IOMapArg;
+	}
           
-          CallInst *TargetToInline = nullptr;
+	CallInst *TargetToInline = nullptr;
           
-          for (Function &F : M) {
-              if (F.isDeclaration() || TargetToInline) break;
+	for (Function &F : M) {
+	  if (F.isDeclaration() || TargetToInline) break;
               
-              for (BasicBlock &BB : F) {
-                  Value *LastIOFD = nullptr;
+	  for (BasicBlock &BB : F) {
+	    Value *LastIOFD = nullptr;
                   
-                  for (Instruction &I : BB) {
-                      if (auto *Call = dyn_cast<CallInst>(&I)) {
-                          Function *Callee = Call->getCalledFunction();
-                          if (!Callee) {
-                              if (!Call->onlyReadsMemory()) LastIOFD = nullptr;
-                              continue;
-                          }
+	    for (Instruction &I : BB) {
+	      if (auto *Call = dyn_cast<CallInst>(&I)) {
+		Function *Callee = Call->getCalledFunction();
+		if (!Callee) {
+		  if (!Call->onlyReadsMemory()) LastIOFD = nullptr;
+		  continue;
+		}
                           
-                          IOArgs Args = getIOArguments(Call, Callee);
-                          if (Args.Type != IOArgs::NONE) {
-                              LastIOFD = Args.Target;
-                              continue;
-                          }
+		IOArgs Args = getIOArguments(Call, Callee);
+		if (Args.Type != IOArgs::NONE) {
+		  LastIOFD = Args.Target;
+		  continue;
+		}
                           
-                          if (IOWrappers.count(Callee)) {
-                              int ArgIdx = IOWrappers[Callee];
-                              Value *PassedFD = Call->getArgOperand(ArgIdx);
-                              if (PassedFD == LastIOFD || LastIOFD != nullptr) {
-                                  TargetToInline = Call;
-                                  break;
-                              }
-                              LastIOFD = PassedFD;
-                          } else {
-                              if (!Call->onlyReadsMemory()) LastIOFD = nullptr;
-                          }
-                      } else if (I.mayWriteToMemory()) {
-                          LastIOFD = nullptr; 
-                      }
-                  }
-                  if (TargetToInline) break;
-              }
-          }
+		if (IOWrappers.count(Callee)) {
+		  int ArgIdx = IOWrappers[Callee];
+		  Value *PassedFD = Call->getArgOperand(ArgIdx);
+		  if (LastIOFD != nullptr && PassedFD == LastIOFD) {
+		    TargetToInline = Call;
+		    break;
+		  }
+		  LastIOFD = PassedFD;
+		} else {
+		  if (!Call->onlyReadsMemory()) LastIOFD = nullptr;
+		}
+	      } else if (I.mayWriteToMemory()) {
+		LastIOFD = nullptr; 
+	      }
+	    }
+	    if (TargetToInline) break;
+	  }
+	}
           
-          if (TargetToInline) {
-              // Grab the caller and callee before we destroy the call instruction via inlining
-              Function *Caller = TargetToInline->getFunction();
-              Function *Callee = TargetToInline->getCalledFunction();
+	if (TargetToInline) {
+	  // Grab the caller and callee before we destroy the call instruction via inlining
+	  Function *Caller = TargetToInline->getFunction();
+	  Function *Callee = TargetToInline->getCalledFunction();
               
-              std::string CallerName = Caller ? llvm::demangle(Caller->getName().str()) : "unknown";
-              std::string CalleeName = Callee ? llvm::demangle(Callee->getName().str()) : "unknown";
+	  std::string CallerName = Caller ? llvm::demangle(Caller->getName().str()) : "unknown";
+	  std::string CalleeName = Callee ? llvm::demangle(Callee->getName().str()) : "unknown";
 
-              InlineFunctionInfo IFI;
-              if (InlineFunction(*TargetToInline, IFI).isSuccess()) {
-                  LocalChanged = true;
-                  Changed = true;
-                  NumIPAInlines++;
+	  InlineFunctionInfo IFI;
+	  if (InlineFunction(*TargetToInline, IFI).isSuccess()) {
+	    LocalChanged = true;
+	    Changed = true;
+	    NumIPAInlines++;
                   
-                  // This will specifically document when an I/O function from one file 
-                  // is merged into a calling function from another file during LTO
-                  logMessage("[IOOpt-LTO] SUCCESS: Inlined I/O wrapper '" + 
-                             Twine(CalleeName) + "' into '" + Twine(CallerName) + "'.");
-              }
-          }
+	    // This will specifically document when an I/O function from one file 
+	    // is merged into a calling function from another file during LTO
+	    logMessage("[IOOpt-LTO] SUCCESS: Inlined I/O wrapper '" + 
+		       Twine(CalleeName) + "' into '" + Twine(CallerName) + "'.");
+	  }
+	}
 
           
       } while (LocalChanged);
@@ -293,39 +288,47 @@ namespace {
     if (V == Target) return true;
     if (Depth > 4) return false; 
     if (auto *Inst = dyn_cast<Instruction>(V)) {
-        for (Value *Op : Inst->operands()) {
-            if (dependsOn(Op, Target, Depth + 1)) return true;
-        }
+      for (Value *Op : Inst->operands()) {
+	if (dependsOn(Op, Target, Depth + 1)) return true;
+      }
     }
     return false;
   }
 
   bool isDeeplySafeFromIO(Function *F, SmallPtrSetImpl<Function*> &Visited) {
-      // 1. If it's an external C library call, we can't see inside it. Unsafe.
-      if (!F || F->isDeclaration()) return false; 
+    // 1. If it's an external C library call, we can't see inside it. Unsafe.
+    if (!F || F->isDeclaration()) return false; 
       
-      // 2. Prevent infinite recursion on recursive functions (like in analyze.c!)
-      if (!Visited.insert(F).second) return true; 
+    // 2. Prevent infinite recursion on recursive functions (like in analyze.c!)
+    if (!Visited.insert(F).second) return true; 
 
-      for (BasicBlock &BB : *F) {
-          for (Instruction &I : BB) {
-              if (auto *LI = dyn_cast<LoadInst>(&I)) { if (LI->isVolatile()) return false; }
-              else if (auto *SI = dyn_cast<StoreInst>(&I)) { if (SI->isVolatile()) return false; }
-              else if (auto *MI = dyn_cast<MemIntrinsic>(&I)) { if (MI->isVolatile()) return false; }
+      
+    for (BasicBlock &BB : *F) {
+      for (Instruction &I : BB) {
+	if (auto *LI = dyn_cast<LoadInst>(&I)) { if (LI->isVolatile()) return false; }
+	else if (auto *SI = dyn_cast<StoreInst>(&I)) { if (SI->isVolatile()) return false; }
+	else if (auto *MI = dyn_cast<MemIntrinsic>(&I)) { if (MI->isVolatile()) return false; }
 
-              // Dealbreaker 2: Calls to unknown functions or known I/O
-              if (auto *Call = dyn_cast<CallInst>(&I)) {
-                  Function *SubCallee = Call->getCalledFunction();
+	// Dealbreaker 2: Calls to unknown functions or known I/O
+	if (auto *Call = dyn_cast<CallInst>(&I)) {
+	  Function *SubCallee = Call->getCalledFunction();
                   
-                  // If it calls a known I/O intrinsic (write, read, fsync, etc.), abort!
-                  if (getIOArguments(Call, SubCallee).Type != IOArgs::NONE) return false;
-                  
-                  // Recursively check the sub-function
-                  if (!isDeeplySafeFromIO(SubCallee, Visited)) return false;
-              }
-          }
+	  // If it calls a known I/O intrinsic (write, read, fsync, etc.), abort!
+	  if (getIOArguments(Call, SubCallee).Type != IOArgs::NONE) return false;
+
+	  // Do not treat sync calls as deelpy safe
+	  if (SubCallee && SubCallee->hasName()) {
+	    StringRef N = SubCallee->getName();
+	    if (N == "fsync" || N == "fdatasync" || N == "msync" || N == "sync_file_range")
+	      return false;
+	  }
+		  
+	  // Recursively check the sub-function
+	  if (!isDeeplySafeFromIO(SubCallee, Visited)) return false;
+	}
       }
-      return true; // Clean bill of health! No I/O, no locks found.
+    }
+    return true; // Clean bill of health! No I/O, no locks found.
   }
 
   bool isSafeToAddToBatch(const SmallVectorImpl<CallInst*> &Batch, CallInst *NewCall, AAResults &AA, const DataLayout &DL, ScalarEvolution &SE, DominatorTree &DT, PostDominatorTree &PDT) {
@@ -341,7 +344,7 @@ namespace {
 
     if (NewArgs.Type == IOArgs::IO_SUBMIT || NewArgs.Type == IOArgs::AIO_WRITE || 
         NewArgs.Type == IOArgs::POSIX_PREADV || NewArgs.Type == IOArgs::POSIX_PWRITEV) {
-        return false;
+      return false;
     }
 
     if (!FirstArgs.Buffer || !NewArgs.Buffer) return false;
@@ -352,7 +355,7 @@ namespace {
 
     auto getPreciseLoc = [&](Value *Buf, Value *Len) {
       if (Len && isa<ConstantInt>(Len)) {
-          return MemoryLocation(Buf, LocationSize::precise(cast<ConstantInt>(Len)->getZExtValue()));
+	return MemoryLocation(Buf, LocationSize::precise(cast<ConstantInt>(Len)->getZExtValue()));
       }
       return MemoryLocation(Buf, LocationSize::beforeOrAfterPointer());
     };
@@ -360,12 +363,12 @@ namespace {
     if (!DT.dominates(LastCall, NewCall)) return false;
 
     if (isReadBatch) {
-    if (NewArgs.Length) {
+      if (NewArgs.Length) {
         if (auto *Inst = dyn_cast<Instruction>(NewArgs.Length)) {
-            if (!DT.dominates(Inst, Batch.front())) return false;
+	  if (!DT.dominates(Inst, Batch.front())) return false;
         }
+      }
     }
-}
    
 
     if (LastCallee != NewCallee) return false;
@@ -375,7 +378,7 @@ namespace {
     if (!BaseFirst || !BaseNew || BaseFirst != BaseNew) return false;
 
     if (NewArgs.Type == IOArgs::SPLICE || NewArgs.Type == IOArgs::SENDFILE) {
-        if (FirstArgs.Buffer != NewArgs.Buffer) return false;
+      if (FirstArgs.Buffer != NewArgs.Buffer) return false;
     }
 
     if (NewArgs.Type == IOArgs::POSIX_PREAD || NewArgs.Type == IOArgs::POSIX_PWRITE) {
@@ -420,14 +423,14 @@ namespace {
 
     if (BB1 != BB2) {
       if (!PDT.dominates(BB2, BB1)) {
-          if (isReadBatch) return false;
+	if (isReadBatch) return false;
           
-          auto *Term = BB1->getTerminator();
-          if (auto *Br = dyn_cast<BranchInst>(Term)) {
-              if (!Br->isConditional() || !dependsOn(Br->getCondition(), LastCall)) return false;
-          } else {
-              return false;
-          }
+	auto *Term = BB1->getTerminator();
+	if (auto *Br = dyn_cast<BranchInst>(Term)) {
+	  if (!Br->isConditional() || !dependsOn(Br->getCondition(), LastCall)) return false;
+	} else {
+	  return false;
+	}
       }
     }
     
@@ -435,93 +438,93 @@ namespace {
 
     auto checkHazard = [&](Instruction *Inst) -> bool {
       if (auto *CI = dyn_cast<CallInst>(Inst)) {
-          Function *Callee = CI->getCalledFunction();
+	Function *Callee = CI->getCalledFunction();
           
-          // Is it another I/O call? (Definite hazard, break batch)
-          if (getIOArguments(CI, Callee).Type != IOArgs::NONE) return true;
+	// Is it another I/O call? (Definite hazard, break batch)
+	if (getIOArguments(CI, Callee).Type != IOArgs::NONE) return true;
 
-          if (Callee) {
-              // Whitelist purely observational intrinsics
-              if (Callee->isIntrinsic()) {
-                  Intrinsic::ID ID = Callee->getIntrinsicID();
-                  // Do not skip lifetime_start/end. Moving I/O past them causes Use-After-Scope bugs.
-                  // AA will handle lifetime markers correctly below.
-                  if (ID == Intrinsic::dbg_value || ID == Intrinsic::dbg_declare || 
-                      ID == Intrinsic::dbg_label || ID == Intrinsic::assume) {
-                      return false; // Safe to ignore!
-                  }
-              }
-          }
+	if (Callee) {
+	  // Whitelist purely observational intrinsics
+	  if (Callee->isIntrinsic()) {
+	    Intrinsic::ID ID = Callee->getIntrinsicID();
+	    // Do not skip lifetime_start/end. Moving I/O past them causes Use-After-Scope bugs.
+	    // AA will handle lifetime markers correctly below.
+	    if (ID == Intrinsic::dbg_value || ID == Intrinsic::dbg_declare || 
+		ID == Intrinsic::dbg_label || ID == Intrinsic::assume) {
+	      return false; // Safe to ignore!
+	    }
+	  }
+	}
 
-          if (Callee && Callee->hasName()) {
-            StringRef Name = Callee->getName();
-            // Known-safe functions that only read memory or do pure math
-            if (Name == "strlen" || Name == "strnlen" || Name == "strcmp" || 
+	if (Callee && Callee->hasName()) {
+	  StringRef Name = Callee->getName();
+	  // Known-safe functions that only read memory or do pure math
+	  if (Name == "strlen" || Name == "strnlen" || Name == "strcmp" || 
               Name == "htons" || Name == "htonl" || Name == "ntohs" || Name == "ntohl" ||
               Name == "bswap_32" || Name == "bswap_64") {
-              return false; // Safely bypass the batch break!
-            }
-          }
+	    return false; // Safely bypass the batch break!
+	  }
+	}
 
-          if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) {
-              if (!CI->onlyAccessesArgMemory()) {
+	if (!CI->onlyReadsMemory() && !CI->doesNotAccessMemory()) {
+	  if (!CI->onlyAccessesArgMemory()) {
                   
-                  // NEW: Before we panic and break the batch, let's look inside the function!
-                  if (Callee && !Callee->isDeclaration()) {
-                      SmallPtrSet<Function*, 8> Visited;
+	    // NEW: Before we panic and break the batch, let's look inside the function!
+	    if (Callee && !Callee->isDeclaration()) {
+	      SmallPtrSet<Function*, 8> Visited;
                       
-                      if (isDeeplySafeFromIO(Callee, Visited)) {
-                          // SUCCESS! The function mutates global state (like setting 'errno'), 
-                          // but we mathematically proved it doesn't do I/O or acquire locks.
-                          // It is safe to let it fall through to the Alias Analysis checks below!
-                          return false; 
-                      }
-                  }
+	      if (isDeeplySafeFromIO(Callee, Visited)) {
+		// SUCCESS! The function mutates global state (like setting 'errno'), 
+		// but we mathematically proved it doesn't do I/O or acquire locks.
+		// It is safe to let it fall through to the Alias Analysis checks below!
+		return false; 
+	      }
+	    }
 
-                  // If we get here, it's either an external black box or it contains real hazards.
-                  StringRef BadFuncName = Callee ? Callee->getName() : "indirect_call";
-                  logMessage("[IOOpt-Debug] Batch Break: Opaque function '" + BadFuncName + "' may interleave I/O or mutate global state.");
-                  return true; 
-              }
-          }
+	    // If we get here, it's either an external black box or it contains real hazards.
+	    StringRef BadFuncName = Callee ? Callee->getName() : "indirect_call";
+	    logMessage("[IOOpt-Debug] Batch Break: Opaque function '" + BadFuncName + "' may interleave I/O or mutate global state.");
+	    return true; 
+	  }
+	}
       }
 
       // Alias Analysis (AA) Checks
       if (FirstArgs.Type == IOArgs::SPLICE || FirstArgs.Type == IOArgs::SENDFILE) return false;
 
       if (Inst->mayReadOrWriteMemory()) {
-          if (isReadBatch) {
-              if (NewArgs.Buffer->getType()->isPointerTy()) {
-                  MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
-                  // For reads: Check if the intervening instruction Reads or Writes our destination
-                  if (isModOrRefSet(AA.getModRefInfo(Inst, NewLoc))) {
-                      logMessage("[IOOpt-Debug] Batch Break: RAW/WAW dependency on new read buffer.");
-                      return true;
-                  }
-              }
-          } else {
-              if (Inst->mayWriteToMemory()) {
-                  for (CallInst *BC : Batch) {
-                      IOArgs BArgs = getIOArguments(BC);
-                      if (!BArgs.Buffer || !BArgs.Buffer->getType()->isPointerTy()) continue;
-                      MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
-                      // For writes: Only check if the intervening instruction Modifies our source buffer
-                      if (isModSet(AA.getModRefInfo(Inst, BLoc))) {
-                          logMessage("[IOOpt-Debug] Batch Break: WAR dependency on batched write buffer.");
-                          return true; 
-                      }
-                  }
-              }
-          }
+	if (isReadBatch) {
+	  if (NewArgs.Buffer->getType()->isPointerTy()) {
+	    MemoryLocation NewLoc = getPreciseLoc(NewArgs.Buffer, NewArgs.Length);
+	    // For reads: Check if the intervening instruction Reads or Writes our destination
+	    if (isModOrRefSet(AA.getModRefInfo(Inst, NewLoc))) {
+	      logMessage("[IOOpt-Debug] Batch Break: RAW/WAW dependency on new read buffer.");
+	      return true;
+	    }
+	  }
+	} else {
+	  if (Inst->mayWriteToMemory()) {
+	    for (CallInst *BC : Batch) {
+	      IOArgs BArgs = getIOArguments(BC);
+	      if (!BArgs.Buffer || !BArgs.Buffer->getType()->isPointerTy()) continue;
+	      MemoryLocation BLoc = getPreciseLoc(BArgs.Buffer, BArgs.Length);
+	      // For writes: Only check if the intervening instruction Modifies our source buffer
+	      if (isModSet(AA.getModRefInfo(Inst, BLoc))) {
+		logMessage("[IOOpt-Debug] Batch Break: WAR dependency on batched write buffer.");
+		return true; 
+	      }
+	    }
+	  }
+	}
 
-          if (FirstArgs.Target->getType()->isPointerTy()) {
-              MemoryLocation TargetLoc(FirstArgs.Target, LocationSize::beforeOrAfterPointer());
-              if (isModSet(AA.getModRefInfo(Inst, TargetLoc))) return true;
-          }
-          if (Load1 && Load1->getPointerOperand()->getType()->isPointerTy()) {
-              MemoryLocation FdLoc(Load1->getPointerOperand(), LocationSize::beforeOrAfterPointer());
-              if (isModSet(AA.getModRefInfo(Inst, FdLoc))) return true;
-          }
+	if (FirstArgs.Target->getType()->isPointerTy()) {
+	  MemoryLocation TargetLoc(FirstArgs.Target, LocationSize::beforeOrAfterPointer());
+	  if (isModSet(AA.getModRefInfo(Inst, TargetLoc))) return true;
+	}
+	if (Load1 && Load1->getPointerOperand()->getType()->isPointerTy()) {
+	  MemoryLocation FdLoc(Load1->getPointerOperand(), LocationSize::beforeOrAfterPointer());
+	  if (isModSet(AA.getModRefInfo(Inst, FdLoc))) return true;
+	}
       }
       return false; 
     };
@@ -587,29 +590,29 @@ namespace {
                          FirstArgs.Type == IOArgs::CXX_WRITE);
 
     if (isWriteBatch) {
-        bool isConstantTinySize = true;
-        uint64_t ElemSize = 0;
-        if (auto *CSize = dyn_cast_or_null<ConstantInt>(FirstArgs.Length)) {
-            ElemSize = CSize->getZExtValue();
-            if (ElemSize != 1 && ElemSize != 2 && ElemSize != 4 && ElemSize != 8) {
-                isConstantTinySize = false;
-            } else {
-                for (CallInst *C : Batch) {
-                    auto *CS = dyn_cast_or_null<ConstantInt>(getIOArguments(C).Length);
-                    if (!CS || CS->getZExtValue() != ElemSize) {
-                        isConstantTinySize = false;
-                        break;
-                    }
-                }
-            }
-        } else {
-            isConstantTinySize = false;
-        }
+      bool isConstantTinySize = true;
+      uint64_t ElemSize = 0;
+      if (auto *CSize = dyn_cast_or_null<ConstantInt>(FirstArgs.Length)) {
+	ElemSize = CSize->getZExtValue();
+	if (ElemSize != 1 && ElemSize != 2 && ElemSize != 4 && ElemSize != 8) {
+	  isConstantTinySize = false;
+	} else {
+	  for (CallInst *C : Batch) {
+	    auto *CS = dyn_cast_or_null<ConstantInt>(getIOArguments(C).Length);
+	    if (!CS || CS->getZExtValue() != ElemSize) {
+	      isConstantTinySize = false;
+	      break;
+	    }
+	  }
+	}
+      } else {
+	isConstantTinySize = false;
+      }
 
-        if (isConstantTinySize && Batch.size() >= 2 && Batch.size() <= 64) {
-            OutTotalRange = ElemSize; 
-            return IOPattern::Strided;
-        }
+      if (isConstantTinySize && Batch.size() >= 2 && Batch.size() <= 64) {
+	OutTotalRange = ElemSize; 
+	return IOPattern::Strided;
+      }
     }
     
     // Reads are high latency; convert even 2 reads to readv.
@@ -641,7 +644,7 @@ namespace {
       }
       
       if (Batch.size() >= Config.BatchThreshold) {
-          return IOPattern::DynamicShadowBuffer;
+	return IOPattern::DynamicShadowBuffer;
       }
     }
 
@@ -670,45 +673,45 @@ namespace {
 
     Value *TotalDynLen = InsertBuilder.getIntN(FirstArgs.Length->getType()->getIntegerBitWidth(), 0);
     for (CallInst *C : Batch) {
-        Value *L = getIOArguments(C).Length;
-        if (L && L->getType() != TotalDynLen->getType()) L = InsertBuilder.CreateZExtOrTrunc(L, TotalDynLen->getType());
-        if (L) TotalDynLen = InsertBuilder.CreateAdd(TotalDynLen, L, "dyn.len.add"); 
-   }
+      Value *L = getIOArguments(C).Length;
+      if (L && L->getType() != TotalDynLen->getType()) L = InsertBuilder.CreateZExtOrTrunc(L, TotalDynLen->getType());
+      if (L) TotalDynLen = InsertBuilder.CreateAdd(TotalDynLen, L, "dyn.len.add"); 
+    }
  
     CallInst *MergedCall = nullptr;
 
     auto buildArgs = [&](Value *DataBuf) -> SmallVector<Value*, 8> {
-        SmallVector<Value*, 8> NewArgs; 
-        Type *ExpectedBufTy = InsertBuilder.getPtrTy();
-        if (DataBuf && DataBuf->getType() != ExpectedBufTy && DataBuf->getType()->isPointerTy()) {
-            DataBuf = InsertBuilder.CreatePointerBitCastOrAddrSpaceCast(DataBuf, ExpectedBufTy);
-        }
+      SmallVector<Value*, 8> NewArgs; 
+      Type *ExpectedBufTy = InsertBuilder.getPtrTy();
+      if (DataBuf && DataBuf->getType() != ExpectedBufTy && DataBuf->getType()->isPointerTy()) {
+	DataBuf = InsertBuilder.CreatePointerBitCastOrAddrSpaceCast(DataBuf, ExpectedBufTy);
+      }
 
-        if (FirstArgs.Type == IOArgs::MPI_WRITE_AT || FirstArgs.Type == IOArgs::MPI_READ_AT) {
-            NewArgs = { Batch[0]->getArgOperand(0), Batch[0]->getArgOperand(1), DataBuf, TotalDynLen, Batch[0]->getArgOperand(4), Batch[0]->getArgOperand(5) };
-        } else if (FirstArgs.Type == IOArgs::C_FWRITE || FirstArgs.Type == IOArgs::C_FREAD) {
-            Value *SizeOne = InsertBuilder.getIntN(TotalDynLen->getType()->getIntegerBitWidth(), 1);
-            NewArgs = {DataBuf, SizeOne, TotalDynLen, FirstArgs.Target};
-        } else if (FirstArgs.Type == IOArgs::SPLICE) {
-            NewArgs = {Batch[0]->getArgOperand(0), Batch[0]->getArgOperand(1), Batch[0]->getArgOperand(2), Batch[0]->getArgOperand(3), TotalDynLen, Batch[0]->getArgOperand(5)};
-        } else if (FirstArgs.Type == IOArgs::SENDFILE) {
-            NewArgs = {Batch[0]->getArgOperand(0), Batch[0]->getArgOperand(1), Batch[0]->getArgOperand(2), TotalDynLen};
-        } else if (isExplicit) {
-            NewArgs = {FirstArgs.Target, DataBuf, TotalDynLen, Batch[0]->getArgOperand(3)};
-        } else {
-            NewArgs = {FirstArgs.Target, DataBuf, TotalDynLen};
-        }
-        return NewArgs;
+      if (FirstArgs.Type == IOArgs::MPI_WRITE_AT || FirstArgs.Type == IOArgs::MPI_READ_AT) {
+	NewArgs = { Batch[0]->getArgOperand(0), Batch[0]->getArgOperand(1), DataBuf, TotalDynLen, Batch[0]->getArgOperand(4), Batch[0]->getArgOperand(5) };
+      } else if (FirstArgs.Type == IOArgs::C_FWRITE || FirstArgs.Type == IOArgs::C_FREAD) {
+	Value *SizeOne = InsertBuilder.getIntN(TotalDynLen->getType()->getIntegerBitWidth(), 1);
+	NewArgs = {DataBuf, SizeOne, TotalDynLen, FirstArgs.Target};
+      } else if (FirstArgs.Type == IOArgs::SPLICE) {
+	NewArgs = {Batch[0]->getArgOperand(0), Batch[0]->getArgOperand(1), Batch[0]->getArgOperand(2), Batch[0]->getArgOperand(3), TotalDynLen, Batch[0]->getArgOperand(5)};
+      } else if (FirstArgs.Type == IOArgs::SENDFILE) {
+	NewArgs = {Batch[0]->getArgOperand(0), Batch[0]->getArgOperand(1), Batch[0]->getArgOperand(2), TotalDynLen};
+      } else if (isExplicit) {
+	NewArgs = {FirstArgs.Target, DataBuf, TotalDynLen, Batch[0]->getArgOperand(3)};
+      } else {
+	NewArgs = {FirstArgs.Target, DataBuf, TotalDynLen};
+      }
+      return NewArgs;
     };
 
     switch (Pattern) {
     case IOPattern::Contiguous: {
       MergedCall = InsertBuilder.CreateCall(Batch[0]->getCalledFunction(), buildArgs(FirstArgs.Buffer));
       if (FirstArgs.Type == IOArgs::SPLICE || FirstArgs.Type == IOArgs::SENDFILE) {
-          NumZeroCopy++;
-          logMessage("[IOOpt] SUCCESS: N-Way zero-copy kernel transfer merged " + Twine(Batch.size()) + " calls.");
+	NumZeroCopy++;
+	logMessage("[IOOpt] SUCCESS: N-Way zero-copy kernel transfer merged " + Twine(Batch.size()) + " calls.");
       } else {
-          logMessage("[IOOpt] SUCCESS: N-Way contiguous batch merged " + Twine(Batch.size()) + " calls.");
+	logMessage("[IOOpt] SUCCESS: N-Way contiguous batch merged " + Twine(Batch.size()) + " calls.");
       }
       NumBatchesMerged++; 
       break;
@@ -724,7 +727,7 @@ namespace {
         IOArgs Args = getIOArguments(Batch[i]);
         Value *SafeBufPtr = Args.Buffer;
         if (SafeBufPtr->getType() != InsertBuilder.getPtrTy() && SafeBufPtr->getType()->isPointerTy()) {
-            SafeBufPtr = InsertBuilder.CreatePointerBitCastOrAddrSpaceCast(SafeBufPtr, InsertBuilder.getPtrTy());
+	  SafeBufPtr = InsertBuilder.CreatePointerBitCastOrAddrSpaceCast(SafeBufPtr, InsertBuilder.getPtrTy());
         }
         LoadInst *LoadedVal = InsertBuilder.CreateLoad(ElementTy, SafeBufPtr, "strided.load");
         GatherVec = InsertBuilder.CreateInsertElement(GatherVec, LoadedVal, InsertBuilder.getInt32(i), "gather.insert");
@@ -771,35 +774,117 @@ namespace {
     case IOPattern::DynamicShadowBuffer: {
       Type *SizeTy = DL.getIntPtrType(M->getContext());
       Type *Int8Ty = InsertBuilder.getInt8Ty();
-      Type *PtrTy = InsertBuilder.getPtrTy();
-      
-      FunctionCallee MemAlignFunc = M->getOrInsertFunction("posix_memalign", InsertBuilder.getInt32Ty(), PtrTy, SizeTy, SizeTy);
-      FunctionCallee FreeFunc = M->getOrInsertFunction("free", InsertBuilder.getVoidTy(), PtrTy);
-      
+      PointerType *PtrTy = InsertBuilder.getPtrTy(); // opaque ptr
+      Type *Int32Ty = InsertBuilder.getInt32Ty();
+      Type *VoidTy  = InsertBuilder.getVoidTy();
+
+      // int posix_memalign(void **memptr, size_t alignment, size_t size)
+      // In opaque pointer mode, both void* and void** are represented as 'ptr' at the type level;
+      // correctness comes from passing the *address of a pointer slot* for memptr.
+      FunctionType *PosixMemalignTy =
+	FunctionType::get(Int32Ty, {PtrTy, SizeTy, SizeTy}, false);
+      FunctionCallee MemAlignFunc =
+	M->getOrInsertFunction("posix_memalign", PosixMemalignTy);
+
+      FunctionType *FreeTy = FunctionType::get(VoidTy, {PtrTy}, false);
+      FunctionCallee FreeFunc = M->getOrInsertFunction("free", FreeTy);
+
+      // int dprintf(int fd, const char *fmt, ...);
+      FunctionType *DprintfTy = FunctionType::get(Int32Ty, {Int32Ty, PtrTy}, true);
+      FunctionCallee DprintfFn = M->getOrInsertFunction("dprintf", DprintfTy);
+
+      // void abort(void);
+      FunctionType *AbortTy = FunctionType::get(VoidTy, {}, false);
+      FunctionCallee AbortFn = M->getOrInsertFunction("abort", AbortTy);
+
       Function *F = Batch.back()->getFunction();
+
+      // Entry block allocas so TrapBB can load diagnostics.
       IRBuilder<> EntryBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+
+      // Slot to receive heap pointer from posix_memalign (holds a 'ptr' value).
       AllocaInst *HeapBufPtr = EntryBuilder.CreateAlloca(PtrTy, nullptr, "dyn.shadow.ptr");
-      
-      Value *MallocSize = InsertBuilder.CreateZExtOrTrunc(TotalDynLen, SizeTy);
-      InsertBuilder.CreateCall(MemAlignFunc, {HeapBufPtr, InsertBuilder.getIntN(SizeTy->getIntegerBitWidth(), 64), MallocSize});
-      Value *HeapBuf = InsertBuilder.CreateLoad(PtrTy, HeapBufPtr, "dyn.shadow.buf");
-      
-      Value *CurrentOffset = InsertBuilder.getIntN(SizeTy->getIntegerBitWidth(), 0);
+      HeapBufPtr->setAlignment(Align(alignof(void *)));
+
+      // Diagnostic slots (rc and size)
+      AllocaInst *RCSlot = EntryBuilder.CreateAlloca(Int32Ty, nullptr, "ioopt.pmem.rc");
+      RCSlot->setAlignment(Align(4));
+
+      AllocaInst *SizeSlot = EntryBuilder.CreateAlloca(SizeTy, nullptr, "ioopt.pmem.size");
+      SizeSlot->setAlignment(Align(alignof(size_t)));
+
+      // Split the block at InsertPt so we can branch to a fail-fast block before memcpy/write.
+      BasicBlock *OrigBB = InsertPt->getParent();
+      BasicBlock *ContBB = OrigBB->splitBasicBlock(InsertPt, "ioopt.dynshadow.cont");
+
+      // Create trap/diagnostic block (placed before ContBB for nicer layout)
+      BasicBlock *TrapBB = BasicBlock::Create(M->getContext(), "ioopt.dynshadow.fail", F, ContBB);
+
+      // Insert allocation + check in OrigBB, right before its terminator
+      Instruction *OrigTerm = OrigBB->getTerminator();
+      IRBuilder<> PreBuilder(OrigTerm);
+
+      Value *MallocSize = PreBuilder.CreateZExtOrTrunc(TotalDynLen, SizeTy);
+      Value *AlignVal = ConstantInt::get(SizeTy, 64);
+
+      // posix_memalign(&ptr, align, size)
+      Value *RC = PreBuilder.CreateCall(MemAlignFunc, {HeapBufPtr, AlignVal, MallocSize}, "pmem.rc");
+      PreBuilder.CreateStore(RC, RCSlot);
+      PreBuilder.CreateStore(MallocSize, SizeSlot);
+
+      Value *HeapBuf = PreBuilder.CreateLoad(PtrTy, HeapBufPtr, "dyn.shadow.buf");
+
+      // ok = (rc == 0) && (buf != null)
+      Value *OkRC = PreBuilder.CreateICmpEQ(RC, ConstantInt::get(Int32Ty, 0), "pmem.ok.rc");
+      Value *NonNull =
+	PreBuilder.CreateICmpNE(HeapBuf, ConstantPointerNull::get(PtrTy), "pmem.nonnull");
+      Value *Ok = PreBuilder.CreateAnd(OkRC, NonNull, "pmem.ok");
+
+      // Replace unconditional branch inserted by splitBasicBlock with conditional branch
+      OrigTerm->eraseFromParent();
+      BranchInst::Create(ContBB, TrapBB, Ok, OrigBB);
+
+      // ---- TrapBB: print diagnostics and abort ----
+      IRBuilder<> TrapBuilder(TrapBB);
+      Value *RCVal = TrapBuilder.CreateLoad(Int32Ty, RCSlot, "ioopt.pmem.rc.val");
+      Value *SizeVal = TrapBuilder.CreateLoad(SizeTy, SizeSlot, "ioopt.pmem.size.val");
+
+      Value *Fmt = TrapBuilder.CreateGlobalString(
+						  "IOOpt: posix_memalign failed (rc=%d, size=%zu)\\n",
+						  "ioopt.pmem.fmt");
+
+      // dprintf(2, fmt, rc, size)
+      TrapBuilder.CreateCall(DprintfFn, {TrapBuilder.getInt32(2), Fmt, RCVal, SizeVal});
+      TrapBuilder.CreateCall(AbortFn);
+      TrapBuilder.CreateUnreachable();
+
+      // ---- ContBB: build the contiguous heap buffer, emit merged call, free ----
+      IRBuilder<> ContBuilder(&*ContBB->getFirstInsertionPt());
+
+      Value *CurrentOffset = ConstantInt::get(SizeTy, 0);
       for (size_t i = 0; i < Batch.size(); ++i) {
-          CallInst *C = Batch[i];
-          IOArgs Args = getIOArguments(C);
-          Value *Len = InsertBuilder.CreateZExtOrTrunc(Args.Length, SizeTy);
-          Value *DestPtr = InsertBuilder.CreateInBoundsGEP(Int8Ty, HeapBuf, CurrentOffset, "dyn.dest");
-          InsertBuilder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
-          CurrentOffset = InsertBuilder.CreateAdd(CurrentOffset, Len, "dyn.offset");
+	CallInst *C = Batch[i];
+	IOArgs Args = getIOArguments(C);
+
+	Value *Len = ContBuilder.CreateZExtOrTrunc(Args.Length, SizeTy);
+	Value *DestPtr =
+	  ContBuilder.CreateInBoundsGEP(Int8Ty, HeapBuf, CurrentOffset, "dyn.dest");
+
+	ContBuilder.CreateMemCpy(DestPtr, Align(1), Args.Buffer, Align(1), Len);
+	CurrentOffset = ContBuilder.CreateAdd(CurrentOffset, Len, "dyn.offset");
       }
-      
-      MergedCall = InsertBuilder.CreateCall(Batch[0]->getCalledFunction(), buildArgs(HeapBuf));
-      InsertBuilder.CreateCall(FreeFunc, {HeapBuf});
-      NumBatchesMerged++; 
+
+      // Emit merged call using contiguous heap buffer
+      MergedCall = ContBuilder.CreateCall(Batch[0]->getCalledFunction(), buildArgs(HeapBuf));
+
+      // Free heap buffer
+      ContBuilder.CreateCall(FreeFunc, {HeapBuf});
+
+      NumBatchesMerged++;
       logMessage("[IOOpt] SUCCESS: N-Way dynamic ShadowBuffer merged " + Twine(Batch.size()) + " calls.");
       break;
     }
+
 
     case IOPattern::Vectored: {
       Type *Int32Ty = InsertBuilder.getInt32Ty();
@@ -827,12 +912,12 @@ namespace {
         Value *SafeBufPtr = Args.Buffer;
 
         if (DT && isa<Instruction>(SafeBufPtr) && !DT->dominates(cast<Instruction>(SafeBufPtr), InsertPt)) {
-            SCEVExpander Expander(SE, DL, "io.vectored.expander");
-            SafeBufPtr = Expander.expandCodeFor(SE.getSCEV(SafeBufPtr), SafeBufPtr->getType(), InsertPt);
+	  SCEVExpander Expander(SE, DL, "io.vectored.expander");
+	  SafeBufPtr = Expander.expandCodeFor(SE.getSCEV(SafeBufPtr), SafeBufPtr->getType(), InsertPt);
         }
 
         if (SafeBufPtr->getType() != PtrTy && SafeBufPtr->getType()->isPointerTy()) {
-            SafeBufPtr = InsertBuilder.CreatePointerBitCastOrAddrSpaceCast(SafeBufPtr, PtrTy);
+	  SafeBufPtr = InsertBuilder.CreatePointerBitCastOrAddrSpaceCast(SafeBufPtr, PtrTy);
         }       
  
         InsertBuilder.CreateStore(SafeBufPtr, InsertBuilder.CreateStructGEP(IovecTy, IovPtr, 0));
@@ -858,41 +943,41 @@ namespace {
     for (size_t i = 0; i < Batch.size(); ++i) {
       CallInst *C = Batch[i];
       if (C->use_empty()) {
-          C->eraseFromParent();
-          continue;
+	C->eraseFromParent();
+	continue;
       }
 
       IOArgs CArgs = getIOArguments(C);
       Value *Rep = nullptr;
 
       if (CArgs.Type == IOArgs::CXX_WRITE) {
-          Rep = C->getArgOperand(0); 
+	Rep = C->getArgOperand(0); 
       } else if (CArgs.Type == IOArgs::MPI_WRITE_AT || CArgs.Type == IOArgs::MPI_READ_AT) {
-          Rep = RetBuilder.getInt32(0); 
+	Rep = RetBuilder.getInt32(0); 
       } else {
-          Value *ExpectedLen = CArgs.Length;
-          if (CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::C_FREAD) ExpectedLen = C->getArgOperand(2);
+	Value *ExpectedLen = CArgs.Length;
+	if (CArgs.Type == IOArgs::C_FWRITE || CArgs.Type == IOArgs::C_FREAD) ExpectedLen = C->getArgOperand(2);
 
-          if (!isRead && i != Batch.size() - 1) {
-              Rep = ExpectedLen; 
-          } else {
-              Value *RealRet = MergedCall;
-              if (RealRet->getType() != ExpectedLen->getType()) RealRet = RetBuilder.CreateIntCast(RealRet, ExpectedLen->getType(), true);
+	if (!isRead && i != Batch.size() - 1) {
+	  Rep = ExpectedLen; 
+	} else {
+	  Value *RealRet = MergedCall;
+	  if (RealRet->getType() != ExpectedLen->getType()) RealRet = RetBuilder.CreateIntCast(RealRet, ExpectedLen->getType(), true);
               
-              if (FirstArgs.Type == IOArgs::POSIX_WRITE || FirstArgs.Type == IOArgs::POSIX_READ || 
-                  FirstArgs.Type == IOArgs::POSIX_PWRITE || FirstArgs.Type == IOArgs::POSIX_PREAD ||
-                  FirstArgs.Type == IOArgs::SPLICE || FirstArgs.Type == IOArgs::SENDFILE) {
-                  Value *Zero = RetBuilder.getIntN(RealRet->getType()->getIntegerBitWidth(), 0);
-                  Value *IsErr = RetBuilder.CreateICmpSLT(RealRet, Zero);
-                  Rep = RetBuilder.CreateSelect(IsErr, RealRet, ExpectedLen, "spoofed.posix.ret");
-              } else {
-                  Value *TotalDynCast = RetBuilder.CreateIntCast(TotalDynLen, RealRet->getType(), false);
-                  Value *IsPerfect = RetBuilder.CreateICmpEQ(RealRet, TotalDynCast);
-                  Value *Zero = RetBuilder.getIntN(ExpectedLen->getType()->getIntegerBitWidth(), 0);
-                  Rep = RetBuilder.CreateSelect(IsPerfect, ExpectedLen, Zero, "spoofed.cstream.ret");
-              }
-          }
-          if (C->getType() != Rep->getType()) Rep = RetBuilder.CreateIntCast(Rep, C->getType(), false);
+	  if (FirstArgs.Type == IOArgs::POSIX_WRITE || FirstArgs.Type == IOArgs::POSIX_READ || 
+	      FirstArgs.Type == IOArgs::POSIX_PWRITE || FirstArgs.Type == IOArgs::POSIX_PREAD ||
+	      FirstArgs.Type == IOArgs::SPLICE || FirstArgs.Type == IOArgs::SENDFILE) {
+	    Value *Zero = RetBuilder.getIntN(RealRet->getType()->getIntegerBitWidth(), 0);
+	    Value *IsErr = RetBuilder.CreateICmpSLT(RealRet, Zero);
+	    Rep = RetBuilder.CreateSelect(IsErr, RealRet, ExpectedLen, "spoofed.posix.ret");
+	  } else {
+	    Value *TotalDynCast = RetBuilder.CreateIntCast(TotalDynLen, RealRet->getType(), false);
+	    Value *IsPerfect = RetBuilder.CreateICmpEQ(RealRet, TotalDynCast);
+	    Value *Zero = RetBuilder.getIntN(ExpectedLen->getType()->getIntegerBitWidth(), 0);
+	    Rep = RetBuilder.CreateSelect(IsPerfect, ExpectedLen, Zero, "spoofed.cstream.ret");
+	  }
+	}
+	if (C->getType() != Rep->getType()) Rep = RetBuilder.CreateIntCast(Rep, C->getType(), false);
       }
       C->replaceAllUsesWith(Rep);
       C->eraseFromParent();
@@ -922,14 +1007,14 @@ namespace {
     /// This is designed primarily for hoisting WRITE-like calls that read from
     /// the user buffer; it blocks in the presence of ambiguous clobbers.
     static bool isSafeToHoistLoopIOCall(
-        CallInst *Call,
-        const IOArgs &Args,
-        Loop *L,
-        ScalarEvolution &SE,
-        const DataLayout &DL,
-        AAResults &AA,
-        DominatorTree &DT,
-        MemorySSA &MSSA) {
+					CallInst *Call,
+					const IOArgs &Args,
+					Loop *L,
+					ScalarEvolution &SE,
+					const DataLayout &DL,
+					AAResults &AA,
+					DominatorTree &DT,
+					MemorySSA &MSSA) {
 
       // Only attempt on calls where we can reason about buffer and length.
       if (!Args.Buffer || !Args.Length) return false;
@@ -960,15 +1045,14 @@ namespace {
       const SCEV *BufStep = SE.getTruncateOrZeroExtend(BufAR->getStepRecurrence(SE),
                                                        DL.getIntPtrType(Call->getContext()));
       const SCEV *ElemS  = SE.getTruncateOrZeroExtend(SE.getSCEV(Args.Length),
-                                                     DL.getIntPtrType(Call->getContext()));
+						      DL.getIntPtrType(Call->getContext()));
       if (!SE.isKnownNonNegative(BufStep)) return false;
       if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, BufStep, ElemS)) return false;
 
-      // Expand the base pointer for the *start* of the addrec to get a concrete Value*.
-      // We insert nothing here; the expander is used only for constructing MemoryLocation.
-      // (If you prefer not to expand, you can bail out instead.)
-      SCEVExpander Expander(SE, DL, "io.hoist.safety");
-      Value *BasePtr = Expander.expandCodeFor(BufAR->getStart(), Args.Buffer->getType(), Call);
+      const SCEV *Start = BufAR->getStart();
+      auto *U = dyn_cast<SCEVUnknown>(Start);
+      if (!U) return false;
+      Value *BasePtr = U->getValue();
       if (!BasePtr || !BasePtr->getType()->isPointerTy()) return false;
 
       // Precise full-range location that would be written/read by hoisting.
@@ -1005,7 +1089,7 @@ namespace {
           if (!WAR || WAR->getLoop() != L) return false;
 
           const SCEV *WStep = SE.getTruncateOrZeroExtend(WAR->getStepRecurrence(SE),
-                                                        DL.getIntPtrType(Call->getContext()));
+							 DL.getIntPtrType(Call->getContext()));
           if (!SE.isKnownNonNegative(WStep)) return false;
 	  if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, WStep, BufStep)) return false;
 
@@ -1030,7 +1114,7 @@ namespace {
       if (!Preheader || !ExitBB) return false;
 
       if (!L->isLoopSimplifyForm() || !L->isLCSSAForm(DT)) {
-          return false;
+	return false;
       }
 
       const SCEV *BackedgeCount = SE.getBackedgeTakenCount(L);
@@ -1062,27 +1146,27 @@ namespace {
 
               bool hasSideEffects = false;
               for (BasicBlock *ScanBB : L->blocks()) {
-                  for (Instruction &ScanInst : *ScanBB) {
-                      if (&ScanInst == Call) continue;
+		for (Instruction &ScanInst : *ScanBB) {
+		  if (&ScanInst == Call) continue;
                       
-                      if (Args.Target->getType()->isPointerTy() && ScanInst.mayWriteToMemory()) {
-                          MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
-                          if (isModSet(AA.getModRefInfo(&ScanInst, TargetLoc))) {
-                              logMessage("[IOOpt-Debug] Loop Hoist Blocked: Loop contains aliased mutation of File Stream.");
-                              hasSideEffects = true;
-                              break;
-                          }
-                      }
+		  if (Args.Target->getType()->isPointerTy() && ScanInst.mayWriteToMemory()) {
+		    MemoryLocation TargetLoc(Args.Target, LocationSize::beforeOrAfterPointer());
+		    if (isModSet(AA.getModRefInfo(&ScanInst, TargetLoc))) {
+		      logMessage("[IOOpt-Debug] Loop Hoist Blocked: Loop contains aliased mutation of File Stream.");
+		      hasSideEffects = true;
+		      break;
+		    }
+		  }
                       
-                      if (auto *ScanCall = dyn_cast<CallInst>(&ScanInst)) {
-                          if (getIOArguments(ScanCall).Type != IOArgs::NONE || (!ScanCall->onlyReadsMemory() && !ScanCall->doesNotAccessMemory())) {
-                              logMessage("[IOOpt-Debug] Loop Hoist Blocked: Opaque call or interleaved I/O would scramble temporal order.");
-                              hasSideEffects = true;
-                              break;
-                          }
-                      }
-                  }
-                  if (hasSideEffects) break;
+		  if (auto *ScanCall = dyn_cast<CallInst>(&ScanInst)) {
+		    if (getIOArguments(ScanCall).Type != IOArgs::NONE || (!ScanCall->onlyReadsMemory() && !ScanCall->doesNotAccessMemory())) {
+		      logMessage("[IOOpt-Debug] Loop Hoist Blocked: Opaque call or interleaved I/O would scramble temporal order.");
+		      hasSideEffects = true;
+		      break;
+		    }
+		  }
+		}
+		if (hasSideEffects) break;
               }
               if (hasSideEffects) continue;
 
@@ -1107,7 +1191,7 @@ namespace {
                 const SCEV *StepSCEV = SE.getTruncateOrZeroExtend(AddRec->getStepRecurrence(SE), IntPtrTy);
                 
                 if (auto *StepConst = dyn_cast<SCEVConstant>(StepSCEV)) {
-                    if (StepConst->getValue()->isNegative()) continue; 
+		  if (StepConst->getValue()->isNegative()) continue; 
                 }
 
                 if (StepSCEV != ElementSizeSCEV) continue;
@@ -1169,11 +1253,11 @@ namespace {
       std::unordered_map<Value*, uint64_t> ActiveBatchBytes;
 
       auto flushAllBatches = [&]() {
-          for (auto &Pair : ActiveBatches) {
-              if (flushBatch(Pair.second, F.getParent(), SE, &DT)) Changed = true;
-          }
-          ActiveBatches.clear();
-          ActiveBatchBytes.clear();
+	for (auto &Pair : ActiveBatches) {
+	  if (flushBatch(Pair.second, F.getParent(), SE, &DT)) Changed = true;
+	}
+	ActiveBatches.clear();
+	ActiveBatchBytes.clear();
       };
 
       for (BasicBlock &BB : F) {
@@ -1186,17 +1270,17 @@ namespace {
               
               if (FuncName == "fsync" || FuncName == "fdatasync" || FuncName == "sync_file_range" || FuncName == "posix_fadvise" || FuncName == "posix_fadvise64") {
                 if (Call->arg_size() > 0) {
-                    Value *SyncTarget = Call->getArgOperand(0);
-                    Value *BaseFD = getBaseFD(SyncTarget);
-                    if (ActiveBatches.count(BaseFD) && !ActiveBatches[BaseFD].empty()) {
-                        if (flushBatch(ActiveBatches[BaseFD], F.getParent(), SE, &DT)) Changed = true;
-                        ActiveBatchBytes[BaseFD] = 0;
-                    }
+		  Value *SyncTarget = Call->getArgOperand(0);
+		  Value *BaseFD = getBaseFD(SyncTarget);
+		  if (BaseFD && ActiveBatches.count(BaseFD) && !ActiveBatches[BaseFD].empty()) {
+		    if (flushBatch(ActiveBatches[BaseFD], F.getParent(), SE, &DT)) Changed = true;
+		    ActiveBatchBytes[BaseFD] = 0;
+		  }
                 }
                 continue; 
               } else if (FuncName == "madvise") {
-                  flushAllBatches();
-                  continue;
+		flushAllBatches();
+		continue;
               }
             }
 
@@ -1208,41 +1292,43 @@ namespace {
                 
               uint64_t CallBytes = 4096; 
               if (CArgs.Length && isa<ConstantInt>(CArgs.Length)) {
-                  CallBytes = cast<ConstantInt>(CArgs.Length)->getZExtValue();
+		CallBytes = cast<ConstantInt>(CArgs.Length)->getZExtValue();
               } else if (CArgs.Length && SE.isSCEVable(CArgs.Length->getType())) {
-                  const SCEV *LenSCEV = SE.getSCEV(CArgs.Length);
-                  auto Max = SE.getUnsignedRangeMax(LenSCEV);
-                  if (Max.getBitWidth() <= 64 && Max.getZExtValue() < Config.HighWaterMark) {
-                      CallBytes = Max.getZExtValue();
-                  }
+		const SCEV *LenSCEV = SE.getSCEV(CArgs.Length);
+		auto Max = SE.getUnsignedRangeMax(LenSCEV);
+		if (Max.getBitWidth() <= 64 && Max.getZExtValue() < Config.HighWaterMark) {
+		  CallBytes = Max.getZExtValue();
+		}
               }
 
               Value *BaseFD = getBaseFD(CArgs.Target);
-              auto &Batch = ActiveBatches[BaseFD];
-
-              if (!Batch.empty()) {
-                IOArgs BatchArgs = getIOArguments(Batch.front());
-                bool BatchIsRead = (BatchArgs.Type == IOArgs::POSIX_READ || BatchArgs.Type == IOArgs::C_FREAD || BatchArgs.Type == IOArgs::POSIX_PREAD || BatchArgs.Type == IOArgs::MPI_READ_AT || BatchArgs.Type == IOArgs::CXX_READ);
-                if (BatchIsRead != isRead) {
-                  if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
-                  ActiveBatchBytes[BaseFD] = 0;
-                }
-              }
-
-              if (isSafeToAddToBatch(Batch, Call, AA, DL, SE, DT, PDT)) {
-                Batch.push_back(Call);
-                ActiveBatchBytes[BaseFD] += CallBytes;
-
-                if (ActiveBatchBytes[BaseFD] >= Config.HighWaterMark) {
-                  if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
-                  ActiveBatchBytes[BaseFD] = 0;
-                }
-              } else {
-                if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
-                Batch.push_back(Call);
-                ActiveBatchBytes[BaseFD] = CallBytes; 
-              }
-            }
+	      if(BaseFD) {
+		auto &Batch = ActiveBatches[BaseFD];
+		
+		if (!Batch.empty()) {
+		  IOArgs BatchArgs = getIOArguments(Batch.front());
+		  bool BatchIsRead = (BatchArgs.Type == IOArgs::POSIX_READ || BatchArgs.Type == IOArgs::C_FREAD || BatchArgs.Type == IOArgs::POSIX_PREAD || BatchArgs.Type == IOArgs::MPI_READ_AT || BatchArgs.Type == IOArgs::CXX_READ);
+		  if (BatchIsRead != isRead) {
+		    if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
+		    ActiveBatchBytes[BaseFD] = 0;
+		  }
+		}
+		
+		if (isSafeToAddToBatch(Batch, Call, AA, DL, SE, DT, PDT)) {
+		  Batch.push_back(Call);
+		  ActiveBatchBytes[BaseFD] += CallBytes;
+		  
+		  if (ActiveBatchBytes[BaseFD] >= Config.HighWaterMark) {
+		    if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
+		    ActiveBatchBytes[BaseFD] = 0;
+		  }
+		} else {
+		  if (flushBatch(Batch, F.getParent(), SE, &DT)) Changed = true;
+		  Batch.push_back(Call);
+		  ActiveBatchBytes[BaseFD] = CallBytes; 
+		}
+	      }
+	    }
           }
         }
       }
@@ -1261,57 +1347,57 @@ llvmGetPassPluginInfo() {
         
       // Command-line parsing for Function-level 'opt -passes=io-opt'
       PB.registerPipelineParsingCallback(
-          [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
-            if (Name == "io-opt") {
-              FPM.addPass(IOOptimisationPass()); 
-              return true;
-            }
-            return false;
-          });
+					 [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
+					   if (Name == "io-opt") {
+					     FPM.addPass(IOOptimisationPass()); 
+					     return true;
+					   }
+					   return false;
+					 });
 
       // Command-line parsing for our Python Harness 'opt -passes=io-lto-merge'
       PB.registerPipelineParsingCallback(
-          [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
-            if (Name == "io-lto-merge") {
-              // First, inline cross-file I/O wrappers now that files are merged
-              MPM.addPass(InterProceduralIOBatchingPass());
-              // Then, run the actual batching/vectoring passes
-              FunctionPassManager FPM;
-              FPM.addPass(LoopSimplifyPass());
-              FPM.addPass(LCSSAPass());
-              FPM.addPass(IOOptimisationPass());
-              MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM))); 
-              return true;
-            }
-            return false;
-          });
+					 [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
+					   if (Name == "io-lto-merge") {
+					     // First, inline cross-file I/O wrappers now that files are merged
+					     MPM.addPass(InterProceduralIOBatchingPass());
+					     // Then, run the actual batching/vectoring passes
+					     FunctionPassManager FPM;
+					     FPM.addPass(LoopSimplifyPass());
+					     FPM.addPass(LCSSAPass());
+					     FPM.addPass(IOOptimisationPass());
+					     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM))); 
+					     return true;
+					   }
+					   return false;
+					 });
 
       // Keep our early pipeline start callback
       PB.registerPipelineStartEPCallback(
-          [](ModulePassManager &MPM, OptimizationLevel Level) {
-            MPM.addPass(InterProceduralIOBatchingPass());
-          });
+					 [](ModulePassManager &MPM, OptimizationLevel Level) {
+					   MPM.addPass(InterProceduralIOBatchingPass());
+					 });
 
       // Standard Compile-Time Optimization
       PB.registerOptimizerLastEPCallback(
-          [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
-            FunctionPassManager FPM;
-            FPM.addPass(LoopSimplifyPass());
-            FPM.addPass(LCSSAPass());
-            FPM.addPass(IOOptimisationPass());
-            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM))); 
-          });
+					 [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+					   FunctionPassManager FPM;
+					   FPM.addPass(LoopSimplifyPass());
+					   FPM.addPass(LCSSAPass());
+					   FPM.addPass(IOOptimisationPass());
+					   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM))); 
+					 });
 
       // Standard Clang LTO Callback (-flto)
       PB.registerFullLinkTimeOptimizationLastEPCallback(
-          [](ModulePassManager &MPM, OptimizationLevel Level) {
-            // Added Interprocedural pass here to catch cross-file I/O wrappers!
-            MPM.addPass(InterProceduralIOBatchingPass());
-            FunctionPassManager FPM;
-            FPM.addPass(LoopSimplifyPass());
-            FPM.addPass(LCSSAPass());
-            FPM.addPass(IOOptimisationPass());
-            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM))); 
-          });
+							[](ModulePassManager &MPM, OptimizationLevel Level) {
+							  // Added Interprocedural pass here to catch cross-file I/O wrappers!
+							  MPM.addPass(InterProceduralIOBatchingPass());
+							  FunctionPassManager FPM;
+							  FPM.addPass(LoopSimplifyPass());
+							  FPM.addPass(LCSSAPass());
+							  FPM.addPass(IOOptimisationPass());
+							  MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM))); 
+							});
     }};
 }
