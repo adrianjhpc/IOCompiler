@@ -15,68 +15,87 @@ const char* EXPECTED_HEADER = "P6\n4000 4000\n255\n";
 // -----------------------------------------------------------------------------
 // Correctness verification
 // -----------------------------------------------------------------------------
+#include <cstdint>
+// ... keep your other includes ...
+
 bool verify_output() {
     std::cout << "Verifying binary correctness...\n";
-    
+
     std::ifstream file(FILENAME, std::ios::binary);
     if (!file) {
         std::cerr << "[FAIL] Could not open output file for verification.\n";
         return false;
     }
 
+    // Verify total file size first (fast sanity check)
+    const std::size_t header_len = std::strlen(EXPECTED_HEADER);
+    const std::uint64_t expected_size =
+        static_cast<std::uint64_t>(header_len) +
+        static_cast<std::uint64_t>(TOTAL_PIXELS) * 3ULL;
+
+    file.seekg(0, std::ios::end);
+    std::uint64_t actual_size = static_cast<std::uint64_t>(file.tellg());
+    file.seekg(0, std::ios::beg);
+
+    if (actual_size != expected_size) {
+        std::cerr << "[FAIL] File size mismatch. Expected " << expected_size
+                  << " bytes, got " << actual_size << " bytes.\n";
+        return false;
+    }
+
     // Verify header
-    size_t header_len = strlen(EXPECTED_HEADER);
     std::vector<char> header_buf(header_len);
-    file.read(header_buf.data(), header_len);
-    
+    file.read(header_buf.data(), static_cast<std::streamsize>(header_len));
+    if (file.gcount() != static_cast<std::streamsize>(header_len)) {
+        std::cerr << "[FAIL] Truncated file while reading header.\n";
+        return false;
+    }
     if (std::memcmp(header_buf.data(), EXPECTED_HEADER, header_len) != 0) {
         std::cerr << "[FAIL] Header corruption detected.\n";
         return false;
     }
 
-    // Verify pixel data (buffered for speed)
-    // We read in chunks of one row (4000 pixels * 3 bytes) at a time
-    std::vector<char> row_buffer(WIDTH * 3);
-    int pixel_count = 0;
+    // Verify pixel data (read one row at a time)
+    std::vector<std::uint8_t> row_buffer(static_cast<std::size_t>(WIDTH) * 3);
+    int pixel_index = 0;
 
     for (int y = 0; y < HEIGHT; y++) {
-        file.read(row_buffer.data(), row_buffer.size());
-        
-        if (file.gcount() != row_buffer.size()) {
+        file.read(reinterpret_cast<char*>(row_buffer.data()),
+                  static_cast<std::streamsize>(row_buffer.size()));
+
+        if (file.gcount() != static_cast<std::streamsize>(row_buffer.size())) {
             std::cerr << "[FAIL] File truncated early at row " << y << ".\n";
             return false;
         }
 
         for (int x = 0; x < WIDTH; x++) {
-            // Recalculate the expected color mathematically
-            char expected_r = (pixel_count % 255);
-            char expected_g = ((pixel_count / WIDTH) % 255);
-            uint8_t expected_b = 128;
+            const std::uint8_t expected_r = static_cast<std::uint8_t>(pixel_index % 255);
+            const std::uint8_t expected_g = static_cast<std::uint8_t>((pixel_index / WIDTH) % 255);
+            const std::uint8_t expected_b = 128;
 
-            int buf_idx = x * 3;
-            if (row_buffer[buf_idx] != expected_r || 
-                row_buffer[buf_idx + 1] != expected_g || 
-                row_buffer[buf_idx + 2] != expected_b) {
-                
-                std::cerr << "[FAIL] Pixel corruption at index " << pixel_count << " (X: " << x << ", Y: " << y << ").\n";
-                std::cerr << "Expected: [" << (int)expected_r << ", " << (int)expected_g << ", " << (int)expected_b << "]\n";
-                std::cerr << "Got:      [" << (int)row_buffer[buf_idx] << ", " << (int)row_buffer[buf_idx+1] << ", " << (int)row_buffer[buf_idx+2] << "]\n";
+            const std::size_t idx = static_cast<std::size_t>(x) * 3;
+            const std::uint8_t got_r = row_buffer[idx + 0];
+            const std::uint8_t got_g = row_buffer[idx + 1];
+            const std::uint8_t got_b = row_buffer[idx + 2];
+
+            if (got_r != expected_r || got_g != expected_g || got_b != expected_b) {
+                std::cerr << "[FAIL] Pixel corruption at index " << pixel_index
+                          << " (X: " << x << ", Y: " << y << ").\n";
+                std::cerr << "Expected: [" << (unsigned)expected_r << ", "
+                          << (unsigned)expected_g << ", " << (unsigned)expected_b << "]\n";
+                std::cerr << "Got:      [" << (unsigned)got_r << ", "
+                          << (unsigned)got_g << ", " << (unsigned)got_b << "]\n";
                 return false;
             }
-            pixel_count++;
+
+            pixel_index++;
         }
     }
 
-    // Ensure there is no garbage data appended at the end
-    char eof_check;
-    if (file.read(&eof_check, 1)) {
-        std::cerr << "[FAIL] File contains extra trailing bytes.\n";
-        return false;
-    }
-
-    std::cout << "[PASS] 100% Data Integrity! (" << pixel_count << " pixels verified natively).\n";
+    std::cout << "[PASS] 100% Data Integrity! (" << pixel_index << " pixels verified).\n";
     return true;
 }
+
 
 // -----------------------------------------------------------------------------
 // Benchmark
