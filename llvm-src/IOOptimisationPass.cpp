@@ -15,6 +15,7 @@
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h" 
@@ -902,9 +903,128 @@ namespace {
   }
 
   struct IOOptimisationPass : public PassInfoMixin<IOOptimisationPass> {
-    
-    bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL, LoopInfo &LI, DominatorTree &DT, AAResults &AA) {
-      
+    /// Return the pointer operand for common memory-writing instructions.
+    /// If we cannot confidently extract a destination pointer, return nullptr
+    /// (conservatively blocks hoisting when aliasing is possible).
+    static Value *getMemoryWritePtr(Instruction &I) {
+      if (auto *SI = dyn_cast<StoreInst>(&I)) return SI->getPointerOperand();
+      if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) return RMW->getPointerOperand();
+      if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) return CX->getPointerOperand();
+      if (auto *MT = dyn_cast<MemTransferInst>(&I)) return MT->getDest();
+      if (auto *MS = dyn_cast<MemSetInst>(&I)) return MS->getDest();
+      return nullptr;
+    }
+
+    /// Conservative proof that it is safe to hoist a loop-contained POSIX-style
+    /// read/write out of the loop, without changing the *data* written/read by
+    /// each iteration.
+    ///
+    /// This is designed primarily for hoisting WRITE-like calls that read from
+    /// the user buffer; it blocks in the presence of ambiguous clobbers.
+    static bool isSafeToHoistLoopIOCall(
+        CallInst *Call,
+        const IOArgs &Args,
+        Loop *L,
+        ScalarEvolution &SE,
+        const DataLayout &DL,
+        AAResults &AA,
+        DominatorTree &DT,
+        MemorySSA &MSSA) {
+
+      // Only attempt on calls where we can reason about buffer and length.
+      if (!Args.Buffer || !Args.Length) return false;
+      if (!isa<ConstantInt>(Args.Length)) return false;
+
+      auto *LenC = cast<ConstantInt>(Args.Length);
+      uint64_t ElemLen = LenC->getZExtValue();
+      if (ElemLen == 0) return false;
+
+      // Require a computable constant trip count so we can precisely bound the range.
+      const SCEV *BackedgeCount = SE.getBackedgeTakenCount(L);
+      if (isa<SCEVCouldNotCompute>(BackedgeCount)) return false;
+      auto *BEC = dyn_cast<SCEVConstant>(BackedgeCount);
+      if (!BEC) return false;
+
+      uint64_t Trips = BEC->getAPInt().getZExtValue() + 1;
+      if (Trips == 0) return false;
+
+      // Avoid overflow when forming a precise LocationSize.
+      if (Trips > (std::numeric_limits<uint64_t>::max() / ElemLen)) return false;
+      uint64_t TotalLen = Trips * ElemLen;
+
+      // Buffer must be an addrec in *this* loop with step == element size.
+      const SCEV *BufS = SE.getSCEV(Args.Buffer);
+      auto *BufAR = dyn_cast<SCEVAddRecExpr>(BufS);
+      if (!BufAR || BufAR->getLoop() != L) return false;
+
+      const SCEV *BufStep = SE.getTruncateOrZeroExtend(BufAR->getStepRecurrence(SE),
+                                                       DL.getIntPtrType(Call->getContext()));
+      const SCEV *ElemS  = SE.getTruncateOrZeroExtend(SE.getSCEV(Args.Length),
+                                                     DL.getIntPtrType(Call->getContext()));
+      if (!SE.isKnownNonNegative(BufStep)) return false;
+      if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, BufStep, ElemS)) return false;
+
+      // Expand the base pointer for the *start* of the addrec to get a concrete Value*.
+      // We insert nothing here; the expander is used only for constructing MemoryLocation.
+      // (If you prefer not to expand, you can bail out instead.)
+      SCEVExpander Expander(SE, DL, "io.hoist.safety");
+      Value *BasePtr = Expander.expandCodeFor(BufAR->getStart(), Args.Buffer->getType(), Call);
+      if (!BasePtr || !BasePtr->getType()->isPointerTy()) return false;
+
+      // Precise full-range location that would be written/read by hoisting.
+      MemoryLocation FullRange(BasePtr, LocationSize::precise(TotalLen));
+
+      // MemorySSA-style scan: only consider MemoryDefs (actual clobbers).
+      // Any ambiguous clobber of FullRange that can occur after the per-iteration
+      // I/O call would make hoisting unsafe.
+      for (BasicBlock *BB : L->blocks()) {
+        for (Instruction &I : *BB) {
+          if (&I == Call) continue;
+          if (!I.mayWriteToMemory()) continue;
+
+          // If MemorySSA has no access for this instruction, treat conservatively.
+          // (Most memory-writing instructions should have one.)
+          MemoryAccess *MA = MSSA.getMemoryAccess(&I);
+          if (!MA) return false;
+          if (!isa<MemoryDef>(MA)) continue;
+
+          // If it doesn't mod our full range, ignore it.
+          if (!isModSet(AA.getModRefInfo(&I, FullRange))) continue;
+
+          // It must dominate the I/O call, meaning it is guaranteed to execute
+          // before the call on all paths (and, in the same block, appear earlier).
+          if (!DT.dominates(&I, Call)) return false;
+
+          // Further restrict: the write should be to the same per-iteration "slice family"
+          // as the I/O buffer addrec. If we cannot prove this, block hoisting.
+          Value *WPtr = getMemoryWritePtr(I);
+          if (!WPtr) return false;
+
+          const SCEV *WS = SE.getSCEV(WPtr);
+          auto *WAR = dyn_cast<SCEVAddRecExpr>(WS);
+          if (!WAR || WAR->getLoop() != L) return false;
+
+          const SCEV *WStep = SE.getTruncateOrZeroExtend(WAR->getStepRecurrence(SE),
+                                                        DL.getIntPtrType(Call->getContext()));
+          if (!SE.isKnownNonNegative(WStep)) return false;
+	  if (!SE.isKnownPredicate(ICmpInst::ICMP_EQ, WStep, BufStep)) return false;
+
+          // Allow constant field offsets within the element: WAR.start = BufAR.start  k
+          // with 0 <= k < ElemLen.
+          const SCEV *StartDiff = SE.getMinusSCEV(WAR->getStart(), BufAR->getStart());
+          auto *CD = dyn_cast<SCEVConstant>(StartDiff);
+          if (!CD) return false;
+          uint64_t Off = CD->getAPInt().getZExtValue();
+          if (Off >= ElemLen) return false;
+        }
+      }
+
+      return true;
+    }
+
+
+    bool optimiseLoopIO(Loop *L, ScalarEvolution &SE, const DataLayout &DL, LoopInfo &LI, DominatorTree &DT, AAResults &AA, MemorySSA &MSSA) {    
+                              
       BasicBlock *Preheader = L->getLoopPreheader();
       BasicBlock *ExitBB = L->getExitBlock();
       if (!Preheader || !ExitBB) return false;
@@ -935,6 +1055,11 @@ namespace {
             bool isRead = (Args.Type == IOArgs::POSIX_READ || Args.Type == IOArgs::C_FREAD || Args.Type == IOArgs::CXX_READ);
 
             if (isWrite || isRead) {
+	      // Apply strict safety check before hoisting attempt
+	      if (!isSafeToHoistLoopIOCall(Call, Args, L, SE, DL, AA, DT, MSSA)) {
+                continue;
+              }
+
               bool hasSideEffects = false;
               for (BasicBlock *ScanBB : L->blocks()) {
                   for (Instruction &ScanInst : *ScanBB) {
@@ -1033,10 +1158,11 @@ namespace {
       ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
       DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
       PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
-
+      MemorySSA &MSSA = FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
+      
       auto PreorderLoops = LI.getLoopsInPreorder();
       for (Loop *L : PreorderLoops) {
-        if (optimiseLoopIO(L, SE, DL, LI, DT, AA)) Changed = true;
+        if (optimiseLoopIO(L, SE, DL, LI, DT, AA, MSSA)) Changed = true;
       }
       
       std::unordered_map<Value*, SmallVector<CallInst*, 8>> ActiveBatches;
