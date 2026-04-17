@@ -91,7 +91,7 @@ make -j$(nproc)
 ### Running the Test Suite
 IOOpt includes a `lit` suite verifying the maths, hazards, offset contiguity, and LCSSA dominance rules.
 ```bash
-make check
+make test
 ```
 
 ---
