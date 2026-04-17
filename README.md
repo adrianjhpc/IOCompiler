@@ -9,17 +9,9 @@
 
 By leveraging Link-Time Optimization (LTO), Alias Analysis, and Scalar Evolution (SCEV), IOOpt safely hoists, classifies, and coalesces I/O operations across translation unit boundaries, completely eliminating the developer burden of manual vectorization.
 
-## 🚀 Performance: PostgreSQL 
+## 🚀 Performance
 
-Tested on PostgreSQL running a heavily concurrent `pgbench` OLTP workload, IOOpt successfully mitigates the CPU context-switch bottleneck, pushing the database strictly to its hardware limits with **zero source code modifications**.
-
-| Metric | Baseline (`-O3 -flto`) | IOOpt (`-O3 -flto + IOOpt`) | Delta |
-| :--- | :--- | :--- | :--- |
-| **Read Throughput** | 88,815 TPS | **100,049 TPS** | **+ 12.6%** |
-| **Write Throughput** | 3,592 TPS | **3,644 TPS** | **+ 1.4%** |
-| **Read Latency** | 0.23 ms | **0.20 ms** | **- 13.0%** |
-
-*(Note: Write coalescing is intentionally restricted by dynamic cost models to protect the CPU cache during sequential WAL packing, ensuring absolute memory safety and avoiding LCSSA dominance hazards).*
+Tested on a range of example mini-apps (in the benchmarks directory) we see 2-3x performance improvement using this functionality.
 
 ---
 
