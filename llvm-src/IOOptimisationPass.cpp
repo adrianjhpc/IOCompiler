@@ -46,6 +46,9 @@ namespace llvm {
 #include <cstdlib>
 #include <string>
 #include <unordered_map>
+#include <cerrno>
+#include <limits>
+
 
 using namespace llvm;
 
@@ -56,10 +59,19 @@ STATISTIC(NumZeroCopy, "Number of zero-copy (splice/sendfile) optimizations");
 STATISTIC(NumIPAInlines, "Number of inter-procedural I/O chains collapsed");
 STATISTIC(NumFunctionsAnalyzed, "Number of functions analyzed by IOOpt");
 
-static unsigned getEnvOrDefault(const char* Name, unsigned Default) {
-  if (const char* Val = std::getenv(Name)) return std::stoi(Val);
-  return Default;
+static unsigned getEnvOrDefaultU(const char *Name, unsigned Default) {
+  const char *Val = std::getenv(Name);
+  if (!Val || !*Val) return Default;
+
+  errno = 0;
+  char *End = nullptr;
+  unsigned long X = std::strtoul(Val, &End, 10);
+
+  if (errno != 0 || End == Val || *End != '\0') return Default;
+  if (X == 0 || X > std::numeric_limits<unsigned>::max()) return Default;
+  return static_cast<unsigned>(X);
 }
+
 
 struct IOConfig {
   unsigned BatchThreshold;
@@ -69,16 +81,11 @@ struct IOConfig {
   bool EnableLogging;
 
   IOConfig() {
-    BatchThreshold = getEnvOrDefault("IO_BATCH_THRESHOLD", 4);
-    if(BatchThreshold <= 0) BatchThreshold = 4;
-    ShadowBufferSize = getEnvOrDefault("IO_SHADOW_BUFFER_MAX", 4096);
-    if(ShadowBufferSize <= 0) ShadowBufferSize = 4096;
-    HighWaterMark = getEnvOrDefault("IO_HIGH_WATER_MARK", 65536);
-    if(HighWaterMark <= 0) HighWaterMark = 65536;
-    EnableLogging = getEnvOrDefault("IO_ENABLE_LOGGING", 1) != 0;
-    MaxIov = getEnvOrDefault("IO_MAX_IOV", 1024);
-    if (MaxIov <= 0) MaxIov = 1024;
-
+    BatchThreshold   = getEnvOrDefaultU("IO_BATCH_THRESHOLD", 4);
+    ShadowBufferSize = getEnvOrDefaultU("IO_SHADOW_BUFFER_MAX", 4096);
+    HighWaterMark    = getEnvOrDefaultU("IO_HIGH_WATER_MARK", 65536);
+    MaxIov           = getEnvOrDefaultU("IO_MAX_IOV", 1024);
+    EnableLogging    = getEnvOrDefaultU("IO_ENABLE_LOGGING", 0) != 0;
   }
 };
 
@@ -663,11 +670,6 @@ namespace {
     
     IOPattern Pattern = classifyBatch(Batch, DL, TotalConstSize, &SE);
 
-    if (Pattern == IOPattern::Vectored && Batch.size() > Config.MaxIov) {
-      // Split into chunks of MaxIov and flush chunk-by-chunk.
-      // (Minimal approach: return false and leave scalar calls, but chunking is better.)
-    }
-    
     if (Pattern == IOPattern::Unprofitable) {
       Batch.clear();
       return false; 
@@ -679,7 +681,7 @@ namespace {
     //
     // We conservatively split the batch into chunks and flush them in order.
     if (Pattern == IOPattern::Vectored) {
-      unsigned Limit = Config.MaxIov;
+      unsigned Limit = std::max(1u, Config.MaxIov)
       if (Limit == 0) Limit = 1024;
       if (Batch.size() > Limit) {
 	bool AnyChanged = false;
