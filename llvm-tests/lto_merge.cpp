@@ -9,7 +9,9 @@
 
 // RUN: %llvmlink %t.main.bc %t.logger.bc -o %t.merged.bc
 
-// RUN: %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes="default<O3>,function(io-opt)" %t.merged.bc -disable-output 2>&1 | %FileCheck %s
+// RUN: env IO_ENABLE_LOGGING=0 \
+// RUN:   %opt -load-pass-plugin=%shlibdir/IOOpt%shlibext -passes="default<O3>,function(io-opt)" %t.merged.bc -S -o - | %FileCheck %s
+
 #include <unistd.h>
 #include <string.h>
 
@@ -37,4 +39,12 @@ int main() {
 // --- VERIFICATION ---
 // We expect the LTO linker to successfully inline write_payload
 // and merge all 4 scattered writes into a single writev call.
-// CHECK: [IOOpt] SUCCESS: N-Way converted 4 writes to writev!
+// // CHECK-LABEL: define {{.*}} @main(
+// Ensure the cross-module helper got inlined (no remaining call)
+// CHECK-NOT: call{{.*}} @write_payload
+
+// Ensure batching happened via vectored I/O
+// CHECK: call{{.*}} @writev{{.*}} i32 4
+// CHECK-NOT: call{{.*}} @write(
+// CHECK: ret i32
+

@@ -97,6 +97,22 @@ static void logMessage(const Twine &Msg) {
 
 namespace {
 
+  // Match common external symbol variants without "demangling":
+  //   write
+  //   write@GLIBC_2.2.5
+  //   write@@GLIBC_2.2.5
+  //   write.plt
+  //
+  // Importantly, this avoids matching "writev" when Base is "write".
+  static bool isSymbolName(StringRef Name, StringRef Base) {
+    if (Name == Base) return true;
+    if (!Name.starts_with(Base)) return false;
+    if (Name.size() == Base.size()) return true;
+    char Next = Name[Base.size()];
+    return Next == '@' || Next == '.';
+  }
+
+
   struct IOArgs {
     Value *Target; 
     Value *Buffer; 
@@ -132,37 +148,64 @@ namespace {
 
     if (!F) F = Call->getCalledFunction();
     if (!F || !F->hasName() || !F->isDeclaration()) return {nullptr, nullptr, nullptr, IOArgs::NONE};
+    
+    // Fast-path: match common C/MPI/POSIX symbols directly without demangling.
+    // Demangling is expensive in LTO and unnecessary for the majority of I/O calls.
+    StringRef Name = F->getName();
+    
+    if (isSymbolName(Name, "pread")  || isSymbolName(Name, "pread64"))
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PREAD};
+    if (isSymbolName(Name, "pwrite") || isSymbolName(Name, "pwrite64"))
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PWRITE};
+    if (isSymbolName(Name, "write")  || isSymbolName(Name, "write64"))
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_WRITE};
+    if (isSymbolName(Name, "read")   || isSymbolName(Name, "read64"))
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_READ};
 
-    std::string Demangled = llvm::demangle(F->getName().str());
-    
-    if (Demangled == "pread" || Demangled == "pread64") return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PREAD};
-    if (Demangled == "pwrite" || Demangled == "pwrite64") return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PWRITE};
-    if (Demangled == "write" || Demangled == "write64") return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_WRITE};
-    if (Demangled == "read" || Demangled == "read64")   return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_READ};
-    
-    if (Demangled == "fwrite" || Demangled == "efwrite") {
+        
+    if (isSymbolName(Name, "fwrite") || isSymbolName(Name, "efwrite")) {
       Value *Bytes = getCStreamBytes(Call);
       return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FWRITE} : IOArgs{nullptr, nullptr, nullptr, IOArgs::NONE};
     }
-    if (Demangled == "fread" || Demangled == "efread") {
+    if (isSymbolName(Name, "fread")  || isSymbolName(Name, "efread")) {
       Value *Bytes = getCStreamBytes(Call);
       return Bytes ? IOArgs{Call->getArgOperand(3), Call->getArgOperand(0), Bytes, IOArgs::C_FREAD} : IOArgs{nullptr, nullptr, nullptr, IOArgs::NONE};
     }
 
-    if (Demangled == "preadv" || Demangled == "preadv2") return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PREADV};
-    if (Demangled == "pwritev" || Demangled == "pwritev2") return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PWRITEV};
-    if (Demangled == "splice") return {Call->getArgOperand(2), Call->getArgOperand(0), Call->getArgOperand(4), IOArgs::SPLICE}; 
-    if (Demangled == "sendfile" || Demangled == "sendfile64") return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(3), IOArgs::SENDFILE}; 
-    if (Demangled == "io_submit") return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(1), IOArgs::IO_SUBMIT}; 
-    if (Demangled == "aio_write" || Demangled == "aio_write64") return {Call->getArgOperand(0), nullptr, nullptr, IOArgs::AIO_WRITE}; 
-    if (Demangled == "MPI_File_write_at" || Demangled == "PMPI_File_write_at") return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_WRITE_AT};
-    if (Demangled == "MPI_File_read_at" || Demangled == "PMPI_File_read_at")  return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_READ_AT};
-    if ((Demangled.find("std::basic_ostream") != std::string::npos || Demangled.find("std::ostream") != std::string::npos) && Demangled.find("::write") != std::string::npos) {
-      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::CXX_WRITE};
+    if (isSymbolName(Name, "preadv")  || isSymbolName(Name, "preadv2"))
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PREADV};
+    if (isSymbolName(Name, "pwritev") || isSymbolName(Name, "pwritev2"))
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::POSIX_PWRITEV};
+    if (isSymbolName(Name, "splice"))
+      return {Call->getArgOperand(2), Call->getArgOperand(0), Call->getArgOperand(4), IOArgs::SPLICE};
+    if (isSymbolName(Name, "sendfile") || isSymbolName(Name, "sendfile64"))
+      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(3), IOArgs::SENDFILE};
+    if (isSymbolName(Name, "io_submit"))
+      return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(1), IOArgs::IO_SUBMIT};
+    if (isSymbolName(Name, "aio_write") || isSymbolName(Name, "aio_write64"))
+      return {Call->getArgOperand(0), nullptr, nullptr, IOArgs::AIO_WRITE};
+
+    if (isSymbolName(Name, "MPI_File_write_at") || isSymbolName(Name, "PMPI_File_write_at"))
+      return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_WRITE_AT};
+    if (isSymbolName(Name, "MPI_File_read_at")  || isSymbolName(Name, "PMPI_File_read_at"))
+      return {Call->getArgOperand(0), Call->getArgOperand(2), Call->getArgOperand(3), IOArgs::MPI_READ_AT};
+
+    // Slow-path: demangle only for C++ stream wrappers.
+    // Most C++ functions are Itanium-mangled and start with "_Z".
+    if (Name.starts_with("_Z")) {
+      std::string Demangled = llvm::demangle(Name.str());
+      if ((Demangled.find("std::basic_ostream") != std::string::npos ||
+	   Demangled.find("std::ostream") != std::string::npos) &&
+	  Demangled.find("::write") != std::string::npos) {
+	return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::CXX_WRITE};
+      }
+      if ((Demangled.find("std::basic_istream") != std::string::npos ||
+	   Demangled.find("std::istream") != std::string::npos) &&
+	  Demangled.find("::read") != std::string::npos) {
+	return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::CXX_READ};
+      }
     }
-    if ((Demangled.find("std::basic_istream") != std::string::npos || Demangled.find("std::istream") != std::string::npos) && Demangled.find("::read") != std::string::npos) {
-      return {Call->getArgOperand(0), Call->getArgOperand(1), Call->getArgOperand(2), IOArgs::CXX_READ};
-    }
+
     
     return {nullptr, nullptr, nullptr, IOArgs::NONE};
   }
@@ -171,6 +214,26 @@ namespace {
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
       bool Changed = false;
       bool LocalChanged;
+
+      auto fdKey = [&](Value *V) -> Value * {
+	if (!V) return nullptr;
+	
+	// If the fd is loaded from memory, key by the storage location.
+	if (auto *LI = dyn_cast<LoadInst>(V)) {
+	  Value *Ptr = LI->getPointerOperand();
+	  if (Ptr->getType()->isPointerTy())
+	    return const_cast<Value *>(getUnderlyingObject(Ptr));
+	}
+	
+	// For arguments/constants/other SSA values, fall back to identity.
+	return V;
+      };
+      
+      auto sameFD = [&](Value *A, Value *B) -> bool {
+	Value *KA = fdKey(A);
+	Value *KB = fdKey(B);
+	return KA && KB && KA == KB;
+      };      
       
       do {
 	LocalChanged = false;
@@ -216,18 +279,18 @@ namespace {
                           
 		IOArgs Args = getIOArguments(Call, Callee);
 		if (Args.Type != IOArgs::NONE) {
-		  LastIOFD = Args.Target;
+		  LastIOFD = fdKey(Args.Target);
 		  continue;
 		}
                           
 		if (IOWrappers.count(Callee)) {
 		  int ArgIdx = IOWrappers[Callee];
 		  Value *PassedFD = Call->getArgOperand(ArgIdx);
-		  if (LastIOFD != nullptr && PassedFD == LastIOFD) {
+		  if (LastIOFD != nullptr && sameFD(PassedFD, LastIOFD)) {
 		    TargetToInline = Call;
 		    break;
 		  }
-		  LastIOFD = PassedFD;
+		  LastIOFD = fdKey(PassedFD);
 		} else {
 		  if (!Call->onlyReadsMemory()) LastIOFD = nullptr;
 		}
@@ -681,7 +744,7 @@ namespace {
     //
     // We conservatively split the batch into chunks and flush them in order.
     if (Pattern == IOPattern::Vectored) {
-      unsigned Limit = std::max(1u, Config.MaxIov)
+      unsigned Limit = std::max(1u, Config.MaxIov);
       if (Limit == 0) Limit = 1024;
       if (Batch.size() > Limit) {
 	bool AnyChanged = false;
@@ -1313,7 +1376,7 @@ namespace {
             if (CalleeF) {
               StringRef FuncName = CalleeF->getName();
               
-              if (FuncName == "fsync" || FuncName == "fdatasync" || FuncName == "sync_file_range" || FuncName == "posix_fadvise" || FuncName == "posix_fadvise64") {
+              if (FuncName == "fsync" || FuncName == "fdatasync" || FuncName == "sync_file_range" || FuncName == "posix_fadvise" || FuncName == "posix_fadvise64" || FuncName == "msync" || FuncName == "close" || FuncName == "fclose" || FuncName == "fflush") {
                 if (Call->arg_size() > 0) {
 		  Value *SyncTarget = Call->getArgOperand(0);
 		  Value *BaseFD = getBaseFD(SyncTarget);
